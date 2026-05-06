@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import re
 import shlex
 import time
@@ -7,6 +8,15 @@ from pathlib import Path
 from harbor.agents.terminus_2.asciinema_handler import AsciinemaHandler
 from harbor.environments.base import BaseEnvironment
 from harbor.utils.logger import logger
+
+
+@dataclass(frozen=True)
+class _ProcessInfo:
+    pid: int
+    ppid: int
+    tty: str
+    comm: str
+    cwd: str
 
 
 class TmuxSession:
@@ -18,6 +28,9 @@ class TmuxSession:
     # tmux 1.9, see https://github.com/tmux/tmux/issues/254). Keep a
     # conservative margin below that hard ceiling.
     _TMUX_SEND_KEYS_MAX_COMMAND_LENGTH = 16_000
+    _SHELL_PROCESS_NAMES = frozenset(
+        {"bash", "sh", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
+    )
     GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH = Path(
         "/tmp/get-asciinema-timestamp.sh"
     )
@@ -437,19 +450,42 @@ class TmuxSession:
 
         if self._remote_asciinema_recording_path:
             self._logger.debug("Starting recording.")
-            await self.send_keys(
-                keys=[
-                    f"asciinema rec --stdin {self._remote_asciinema_recording_path}",
-                    "Enter",
-                ],
-                min_timeout_sec=1.0,
-            )
-            await self.send_keys(
-                keys=[
-                    "clear",
-                    "Enter",
-                ],
-            )
+            recording_started = False
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    await self.send_keys(
+                        keys=[
+                            f"asciinema rec --stdin {self._remote_asciinema_recording_path}",
+                            "Enter",
+                        ],
+                        min_timeout_sec=1.0,
+                    )
+                    await self.send_keys(
+                        keys=[
+                            "clear",
+                            "Enter",
+                        ],
+                    )
+                    recording_started = True
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    self._logger.warning(
+                        "Failed to start asciinema recording on attempt %s/3: %s",
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(1)
+
+            if not recording_started:
+                self._logger.warning(
+                    "Continuing without asciinema recording because startup failed: %s",
+                    last_error,
+                )
+                self._disable_recording = True
+                self._remote_asciinema_recording_path = None
+                self._local_asciinema_recording_path = None
 
         if self._remote_asciinema_recording_path:
             await self.environment.upload_file(
@@ -585,9 +621,25 @@ class TmuxSession:
     ):
         start_time_sec = time.time()
 
+        # An empty string is a no-op for tmux send-keys. Terminus emits this when it
+        # only wants to wait for terminal output, and forwarding it to tmux can fail
+        # spuriously with an empty stderr even though the session is healthy.
+        keys = [key for key in keys if key != ""]
+
+        if not keys:
+            if min_timeout_sec > 0:
+                await asyncio.sleep(min_timeout_sec)
+            return
+
         for command in self._tmux_send_keys(keys):
             result = await self.environment.exec(command=command)
             if result.return_code != 0:
+                if not result.stderr and await self.is_session_alive():
+                    await asyncio.sleep(0.2)
+                    retry_result = await self.environment.exec(command=command)
+                    if retry_result.return_code == 0:
+                        continue
+                    result = retry_result
                 raise RuntimeError(
                     f"{self.environment.session_id}: failed to send non-blocking keys: {result.stderr}"
                 )
@@ -645,6 +697,155 @@ class TmuxSession:
             self._tmux_capture_pane(capture_entire=capture_entire)
         )
         return result.stdout or ""
+
+    async def _tmux_display_message(self, format_string: str) -> str | None:
+        result = await self.environment.exec(
+            " ".join(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    shlex.quote(self._session_name),
+                    shlex.quote(format_string),
+                ]
+            )
+        )
+        if result.return_code == 0 and result.stdout:
+            value = result.stdout.strip()
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _parse_process_snapshot_line(line: str) -> _ProcessInfo | None:
+        parts = line.split("\t", 4)
+        if len(parts) != 5:
+            return None
+
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            return None
+
+        return _ProcessInfo(
+            pid=pid,
+            ppid=ppid,
+            tty=parts[2],
+            comm=parts[3],
+            cwd=parts[4],
+        )
+
+    async def _get_process_snapshot(self) -> dict[int, _ProcessInfo]:
+        result = await self.environment.exec(
+            " ".join(
+                [
+                    "for proc in /proc/[0-9]*; do",
+                    'pid=${proc##*/};',
+                    '[ -r "$proc/stat" ] || continue;',
+                    'ppid=$(awk \'{print $4}\' "$proc/stat" 2>/dev/null) || continue;',
+                    'comm=$(cat "$proc/comm" 2>/dev/null) || continue;',
+                    'tty=$(readlink -f "$proc/fd/0" 2>/dev/null || printf "?");',
+                    'cwd=$(readlink -f "$proc/cwd" 2>/dev/null || printf "");',
+                    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\n\' "$pid" "$ppid" "$tty" "$comm" "$cwd";',
+                    "done",
+                ]
+            )
+        )
+        if result.return_code != 0 or not result.stdout:
+            return {}
+
+        processes: dict[int, _ProcessInfo] = {}
+        for line in result.stdout.splitlines():
+            proc = self._parse_process_snapshot_line(line)
+            if proc is not None:
+                processes[proc.pid] = proc
+        return processes
+
+    @classmethod
+    def _select_active_shell_process(
+        cls,
+        processes: dict[int, _ProcessInfo],
+        pane_pid: int,
+    ) -> _ProcessInfo | None:
+        if not processes:
+            return None
+
+        children: dict[int, list[int]] = {}
+        for proc in processes.values():
+            children.setdefault(proc.ppid, []).append(proc.pid)
+
+        shell_priority = {
+            "bash": 4,
+            "zsh": 3,
+            "fish": 3,
+            "sh": 2,
+            "dash": 2,
+            "ksh": 2,
+            "csh": 1,
+            "tcsh": 1,
+        }
+
+        visited: set[int] = set()
+        candidates: list[tuple[int, int, int, int, _ProcessInfo]] = []
+        stack: list[tuple[int, int]] = [(pane_pid, 0)]
+        while stack:
+            pid, depth = stack.pop()
+            if pid in visited:
+                continue
+            visited.add(pid)
+
+            proc = processes.get(pid)
+            if proc is None:
+                continue
+
+            if proc.comm in cls._SHELL_PROCESS_NAMES:
+                candidates.append(
+                    (
+                        depth,
+                        int(proc.tty.startswith("/dev/pts/")),
+                        int(bool(proc.cwd)),
+                        shell_priority.get(proc.comm, 0),
+                        proc,
+                    )
+                )
+
+            for child_pid in children.get(pid, []):
+                stack.append((child_pid, depth + 1))
+
+        if not candidates:
+            return processes.get(pane_pid)
+
+        candidates.sort(key=lambda item: item[:-1] + (item[-1].pid,))
+        return candidates[-1][-1]
+
+    async def get_current_path(self) -> str | None:
+        pane_pid_text = await self._tmux_display_message("#{pane_pid}")
+        if pane_pid_text is not None:
+            try:
+                pane_pid = int(pane_pid_text)
+            except ValueError:
+                pane_pid = None
+            if pane_pid is not None:
+                processes = await self._get_process_snapshot()
+                active_shell = self._select_active_shell_process(processes, pane_pid)
+                if active_shell is not None and active_shell.cwd:
+                    return active_shell.cwd
+
+        return await self._tmux_display_message("#{pane_current_path}")
+
+    def get_previous_buffer(self) -> str | None:
+        return self._previous_buffer
+
+    def restore_previous_buffer(self, previous_buffer: str | None) -> None:
+        self._previous_buffer = previous_buffer
+
+    async def restore_working_directory(self, path: str) -> None:
+        await self.send_keys(
+            keys=[f"cd {shlex.quote(path)} && clear", "Enter"],
+            min_timeout_sec=0.1,
+        )
 
     async def _get_visible_screen(self) -> str:
         return await self.capture_pane(capture_entire=False)

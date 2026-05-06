@@ -72,6 +72,7 @@ class TrialPaths:
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self.verifier_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def config_path(self) -> Path:
@@ -85,6 +86,65 @@ class TrialPaths:
         Useful for saving trajectories and debugging agent behavior.
         """
         return self.trial_dir / "agent"
+
+    @property
+    def agent_sessions_dir(self) -> Path:
+        """Claude Code's live session/config directory."""
+        return self.agent_dir / "sessions"
+
+    @property
+    def agent_session_snapshots_dir(self) -> Path:
+        """Root directory containing round-scoped Claude session snapshots."""
+        return self.agent_dir / "session_snapshots"
+
+    def agent_round_sessions_dir(self, round_num: int) -> Path:
+        """Claude session snapshot captured after a specific round."""
+        return self.agent_session_snapshots_dir / f"round_{round_num}"
+
+    @property
+    def agent_runtime_snapshots_dir(self) -> Path:
+        """Root directory containing round-scoped agent runtime snapshots."""
+        return self.agent_dir / "runtime_snapshots"
+
+    def agent_round_runtime_snapshot_dir(self, round_num: int) -> Path:
+        """Directory containing runtime snapshots captured after a specific round."""
+        return self.agent_runtime_snapshots_dir / f"round_{round_num}"
+
+    def terminus_round_runtime_state_path(self, round_num: int) -> Path:
+        """Round-specific Terminus-2 runtime state snapshot."""
+        return self.agent_round_runtime_snapshot_dir(round_num) / "terminus-2.json"
+
+    @property
+    def agent_pre_resume_trajectories_dir(self) -> Path:
+        """Human-readable trajectory snapshots copied from the resume source."""
+        return self.agent_dir / "pre_resume_trajectories"
+
+    def agent_pre_resume_trajectory_path(self, round_num: int) -> Path:
+        """ATIF trajectory snapshot describing the trace before resuming round_num+1."""
+        return (
+            self.agent_pre_resume_trajectories_dir / f"round_{round_num}_trajectory.json"
+        )
+
+    def agent_pre_resume_metadata_path(self, round_num: int) -> Path:
+        """Metadata describing the copied pre-resume trajectory snapshot."""
+        return self.agent_pre_resume_trajectories_dir / f"round_{round_num}_resume.json"
+
+    @property
+    def agent_pre_resume_sessions_dir(self) -> Path:
+        """Root directory containing copied raw Claude session files used for resume."""
+        return self.agent_dir / "pre_resume_sessions"
+
+    def agent_pre_resume_session_dir(self, round_num: int) -> Path:
+        """Directory containing the raw Claude session files used before resuming."""
+        return self.agent_pre_resume_sessions_dir / f"round_{round_num}"
+
+    def agent_pre_resume_session_metadata_path(self, round_num: int) -> Path:
+        """Metadata describing the copied pre-resume Claude session snapshot."""
+        return self.agent_pre_resume_session_dir(round_num) / "metadata.json"
+
+    def agent_pre_resume_session_files_dir(self, round_num: int) -> Path:
+        """Raw Claude session files copied from the resume source."""
+        return self.agent_pre_resume_session_dir(round_num) / "sessions"
 
     @property
     def artifacts_dir(self) -> Path:
@@ -102,6 +162,33 @@ class TrialPaths:
         A JSON manifest listing all collected artifacts and their sources.
         """
         return self.artifacts_dir / "manifest.json"
+
+    @property
+    def state_dir(self) -> Path:
+        """Directory for environment state snapshot metadata/artifacts."""
+        return self.trial_dir / "state"
+
+    @property
+    def state_snapshot_path(self) -> Path:
+        """JSON metadata describing the captured environment state snapshot."""
+        return self.state_dir / "snapshot.json"
+
+    @property
+    def state_image_archive_path(self) -> Path:
+        """Serialized image archive for restoring snapshot after docker prune."""
+        return self.state_dir / "snapshot-image.tar"
+
+    def round_state_dir(self, round_num: int) -> Path:
+        """Directory containing the snapshot captured after a specific round."""
+        return self.state_dir / f"round_{round_num}"
+
+    def round_state_snapshot_path(self, round_num: int) -> Path:
+        """Round-specific snapshot metadata path."""
+        return self.round_state_dir(round_num) / "snapshot.json"
+
+    def round_state_image_archive_path(self, round_num: int) -> Path:
+        """Round-specific serialized snapshot image archive path."""
+        return self.round_state_dir(round_num) / "snapshot-image.tar"
 
     @property
     def verifier_dir(self) -> Path:

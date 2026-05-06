@@ -87,3 +87,69 @@ class OracleAgent(BaseAgent):
         if result.return_code != 0:
             exit_code_path = self._trial_paths.agent_dir / "exit-code.txt"
             exit_code_path.write_text(str(result.return_code))
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Oracle: upload and run round-specific solution."""
+        if not self._task.is_multiround:
+            return await self.run(instruction, environment, context)
+
+        round_solution_dir = self._task.paths.round_solution_dir(round_num)
+        round_solve_path = self._task.paths.round_solve_path(round_num)
+
+        log_file = f"round_{round_num}_oracle.txt"
+        host_oracle_path = self._trial_paths.agent_dir / log_file
+        container_oracle_log = str(EnvironmentPaths.agent_dir / log_file)
+
+        if environment.is_mounted:
+            host_oracle_path.touch()
+
+        if not round_solve_path.exists():
+            raise FileNotFoundError(
+                f"Solution script not found for round {round_num}: {round_solve_path}"
+            )
+
+        # Upload round-specific solution to /solution/ (overwriting previous)
+        await environment.upload_dir(
+            source_dir=round_solution_dir,
+            target_dir=str(EnvironmentPaths.solution_dir),
+        )
+
+        container_solve = shlex.quote(
+            str(
+                EnvironmentPaths.solution_dir
+                / round_solve_path.relative_to(round_solution_dir)
+            )
+        )
+        container_oracle_log_quoted = shlex.quote(container_oracle_log)
+
+        command = (
+            f"chmod +x {container_solve} && "
+            f"{container_solve} > {container_oracle_log_quoted} 2>&1"
+        )
+
+        env = {"DEBIAN_FRONTEND": "noninteractive"}
+        if self._task.config.solution.env:
+            env.update(resolve_env_vars(self._task.config.solution.env))
+
+        result = await environment.exec(command=command, env=env)
+
+        if not environment.is_mounted:
+            try:
+                await environment.download_file(
+                    source_path=container_oracle_log,
+                    target_path=host_oracle_path,
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to download {log_file}: {e}")
+
+        if result.return_code != 0:
+            exit_code_path = (
+                self._trial_paths.agent_dir / f"round_{round_num}_exit-code.txt"
+            )
+            exit_code_path.write_text(str(result.return_code))

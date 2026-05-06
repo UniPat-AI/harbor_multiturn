@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -5,7 +6,7 @@ from jinja2 import Environment
 from pydantic import BaseModel
 
 from harbor.agents.base import BaseAgent
-from harbor.environments.base import BaseEnvironment
+from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.utils.templating import render_prompt_template
 
@@ -15,6 +16,23 @@ class ExecInput(BaseModel):
     cwd: str | None = None
     env: dict[str, str] | None = None
     timeout_sec: int | None = None
+
+
+TRANSIENT_SETUP_RETURN_CODES = frozenset({7, 28, 35, 52, 56})
+TRANSIENT_SETUP_ERROR_FRAGMENTS = (
+    "unexpected eof while reading",
+    "connection reset",
+    "connection refused",
+    "could not resolve host",
+    "temporary failure",
+    "temporary failure resolving",
+    "network is unreachable",
+    "operation timed out",
+    "read timeout",
+    "tls handshake timeout",
+    "econnreset",
+    "eai_again",
+)
 
 
 class BaseInstalledAgent(BaseAgent, ABC):
@@ -81,6 +99,52 @@ class BaseInstalledAgent(BaseAgent, ABC):
         """Environment variables for install script execution."""
         return {"DEBIAN_FRONTEND": "noninteractive"}
 
+    def _setup_max_attempts(self) -> int:
+        """Maximum number of install script attempts for transient failures."""
+        return 3
+
+    def _setup_retry_delay_sec(self, attempt_number: int) -> float:
+        """Exponential backoff between install retries."""
+        return float(min(2 ** (attempt_number - 1), 5))
+
+    def _is_transient_setup_failure(self, result: ExecResult) -> bool:
+        if result.return_code == 0:
+            return False
+
+        if result.return_code in TRANSIENT_SETUP_RETURN_CODES:
+            return True
+
+        combined_output = "\n".join(
+            part for part in (result.stdout, result.stderr) if part
+        ).lower()
+        return any(
+            fragment in combined_output
+            for fragment in TRANSIENT_SETUP_ERROR_FRAGMENTS
+        )
+
+    def _write_setup_logs(
+        self,
+        setup_dir: Path,
+        result: ExecResult,
+        attempt_number: int,
+    ) -> None:
+        attempt_dir = setup_dir / f"attempt-{attempt_number}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        for output_dir in (setup_dir, attempt_dir):
+            (output_dir / "return-code.txt").write_text(str(result.return_code))
+            self._write_optional_log(output_dir / "stdout.txt", result.stdout)
+            self._write_optional_log(output_dir / "stderr.txt", result.stderr)
+
+    @staticmethod
+    def _write_optional_log(path: Path, content: str | None) -> None:
+        if content:
+            path.write_text(content)
+            return
+
+        if path.exists():
+            path.unlink()
+
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(command="mkdir -p /installed-agent")
 
@@ -104,27 +168,50 @@ class BaseInstalledAgent(BaseAgent, ABC):
             target_path="/installed-agent/install.sh",
         )
 
-        result = await environment.exec(
-            command="bash /installed-agent/install.sh",
-            env=self._setup_env(),
-        )
-
         setup_dir = self.logs_dir / "setup"
         setup_dir.mkdir(parents=True, exist_ok=True)
 
-        (setup_dir / "return-code.txt").write_text(str(result.return_code))
+        max_attempts = max(1, self._setup_max_attempts())
+        result: ExecResult | None = None
+        attempt_number = 0
 
-        if result.stdout:
-            (setup_dir / "stdout.txt").write_text(result.stdout)
-
-        if result.stderr:
-            (setup_dir / "stderr.txt").write_text(result.stderr)
-
-        if result.return_code != 0:
-            raise RuntimeError(
-                f"Agent setup failed with exit code {result.return_code}. "
-                f"See logs in {setup_dir}"
+        for attempt_number in range(1, max_attempts + 1):
+            result = await environment.exec(
+                command="bash /installed-agent/install.sh",
+                env=self._setup_env(),
             )
+            self._write_setup_logs(
+                setup_dir=setup_dir,
+                result=result,
+                attempt_number=attempt_number,
+            )
+
+            if result.return_code == 0:
+                return
+
+            if attempt_number == max_attempts or not self._is_transient_setup_failure(
+                result
+            ):
+                break
+
+            delay_sec = self._setup_retry_delay_sec(attempt_number)
+            self.logger.warning(
+                "Agent setup failed transiently with exit code %d on attempt %d/%d; retrying in %.1fs",
+                result.return_code,
+                attempt_number,
+                max_attempts,
+                delay_sec,
+            )
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
+
+        if result is None:
+            raise RuntimeError("Agent setup produced no execution result.")
+
+        raise RuntimeError(
+            f"Agent setup failed with exit code {result.return_code} after "
+            f"{attempt_number} attempt(s). See logs in {setup_dir}"
+        )
 
     async def run(
         self,

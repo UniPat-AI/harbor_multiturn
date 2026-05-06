@@ -48,9 +48,25 @@ class DockerEnvironment(BaseEnvironment):
     _DOCKER_COMPOSE_BUILD_PATH = COMPOSE_BUILD_PATH
     _DOCKER_COMPOSE_PREBUILT_PATH = COMPOSE_PREBUILT_PATH
     _DOCKER_COMPOSE_NO_NETWORK_PATH = COMPOSE_NO_NETWORK_PATH
+    _SNAPSHOT_STOP_TIMEOUT_SEC = 30
 
     # Class-level lock per image name to prevent parallel builds of the same image.
     _image_build_locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _is_plain_quiet_progress_enabled() -> bool:
+        return os.getenv("HARBOR_PLAIN_QUIET_PROGRESS", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+
+    def _log_resume_state_info(self, message: str, *args) -> None:
+        if self._is_plain_quiet_progress_enabled():
+            self.logger.debug(message, *args)
+        else:
+            self.logger.info(message, *args)
 
     def __init__(
         self,
@@ -60,6 +76,8 @@ class DockerEnvironment(BaseEnvironment):
         trial_paths: TrialPaths,
         task_env_config: EnvironmentConfig,
         keep_containers: bool = False,
+        resume_state_image_ref: str | None = None,
+        resume_state_archive_path: str | None = None,
         *args,
         **kwargs,
     ):
@@ -88,6 +106,12 @@ class DockerEnvironment(BaseEnvironment):
             memory=f"{task_env_config.memory_mb}M",
         )
         self._use_prebuilt = False
+        self._resume_state_image_ref = resume_state_image_ref
+        self._resume_state_archive_path = (
+            Path(resume_state_archive_path)
+            if resume_state_archive_path
+            else None
+        )
 
     @staticmethod
     def type() -> EnvironmentType:
@@ -226,8 +250,112 @@ class DockerEnvironment(BaseEnvironment):
 
         return result
 
+    async def _run_docker_command(
+        self,
+        command: list[str],
+        check: bool = True,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        try:
+            if timeout_sec:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_sec
+                )
+            else:
+                stdout_bytes, stderr_bytes = await process.communicate()
+        except asyncio.TimeoutError:
+            process.terminate()
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=5
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                stdout_bytes, stderr_bytes = await process.communicate()
+            raise RuntimeError(
+                f"Docker command timed out after {timeout_sec} seconds: {' '.join(command)}"
+            )
+
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
+        stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else None
+
+        result = ExecResult(
+            stdout=stdout,
+            stderr=stderr,
+            return_code=process.returncode or 0,
+        )
+
+        if check and result.return_code != 0:
+            raise RuntimeError(
+                f"Docker command failed: docker {' '.join(command)}. "
+                f"Return code: {result.return_code}. Stdout: {result.stdout}. "
+                f"Stderr: {result.stderr}."
+            )
+
+        return result
+
+    async def _docker_image_exists(self, image_ref: str) -> bool:
+        result = await self._run_docker_command(
+            ["image", "inspect", image_ref], check=False
+        )
+        return result.return_code == 0
+
+    async def _get_main_container_id(self, include_stopped: bool = False) -> str | None:
+        command = ["ps"]
+        if include_stopped:
+            command.append("-a")
+        command.extend(["-q", "main"])
+        result = await self._run_docker_compose_command(command, check=False)
+        container_ids = [
+            line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+        ]
+        return container_ids[0] if container_ids else None
+
+    async def _is_main_container_running(self) -> bool:
+        return (await self._get_main_container_id(include_stopped=False)) is not None
+
+    async def _load_image_archive(self, archive_path: Path) -> None:
+        await self._run_docker_command(
+            ["load", "-i", str(archive_path.resolve().absolute())], check=True
+        )
+
     async def start(self, force_build: bool):
         self._use_prebuilt = not force_build and self.task_env_config.docker_image
+        self.restored_from_snapshot = False
+
+        if self._resume_state_image_ref:
+            image_exists = await self._docker_image_exists(self._resume_state_image_ref)
+            if not image_exists and self._resume_state_archive_path:
+                if self._resume_state_archive_path.exists():
+                    self._log_resume_state_info(
+                        "Snapshot image %s not found locally; loading archive %s",
+                        self._resume_state_image_ref,
+                        self._resume_state_archive_path,
+                    )
+                    await self._load_image_archive(self._resume_state_archive_path)
+                    image_exists = await self._docker_image_exists(
+                        self._resume_state_image_ref
+                    )
+            if image_exists:
+                self._use_prebuilt = True
+                self._env_vars.prebuilt_image_name = self._resume_state_image_ref
+                self.restored_from_snapshot = True
+                self._log_resume_state_info(
+                    "Restoring environment from snapshot image: %s",
+                    self._resume_state_image_ref,
+                )
+            elif self._resume_state_image_ref:
+                raise RuntimeError(
+                    f"Required snapshot image is unavailable: {self._resume_state_image_ref}"
+                )
 
         if not self._use_prebuilt:
             # Serialize image builds: if multiple environments with the same image name
@@ -246,9 +374,16 @@ class DockerEnvironment(BaseEnvironment):
         await self._run_docker_compose_command(["up", "--detach", "--wait"])
 
     async def stop(self, delete: bool):
-        # Best-effort: fix ownership of bind-mounted directories so the host
-        # user can read/write/delete them after the container is gone.
-        await self._chown_to_host_user(str(EnvironmentPaths.logs_dir), recursive=True)
+        if await self._is_main_container_running():
+            # Best-effort: fix ownership and permissions of bind-mounted
+            # directories so the host user can read/write/delete them after
+            # the container is gone.
+            await self._chown_to_host_user(str(EnvironmentPaths.logs_dir), recursive=True)
+            # Some agents (e.g. Claude Code) create dirs with mode 700; ensure
+            # they are readable on the host after the container stops.
+            await self.exec(
+                f"chmod -R u+rwX,go+rX {shlex.quote(str(EnvironmentPaths.logs_dir))}"
+            )
 
         if self._keep_containers and delete:
             self.logger.warning(
@@ -318,6 +453,12 @@ class DockerEnvironment(BaseEnvironment):
 
     async def download_dir(self, source_dir: str, target_dir: Path | str):
         await self._chown_to_host_user(source_dir, recursive=True)
+        # Fix directory permissions so downloaded content is readable on the host.
+        # Some agents (e.g. Claude Code) create dirs with mode 700 inside the
+        # container; without this chmod, host-side traversal may hit PermissionError.
+        await self.exec(
+            f"chmod -R u+rwX,go+rX {shlex.quote(source_dir)}"
+        )
         await self._run_docker_compose_command(
             [
                 "cp",
@@ -406,3 +547,90 @@ class DockerEnvironment(BaseEnvironment):
                 + " ".join(compose_base + ["down"]),
             ],
         )
+
+    async def capture_state_snapshot(
+        self,
+        snapshot_id: str,
+        archive_path: Path | None = None,
+        restart_container: bool = False,
+    ) -> dict[str, str] | None:
+        container_id = await self._get_main_container_id(include_stopped=True)
+        if not container_id:
+            self.logger.warning(
+                "Cannot capture snapshot %s: no main container found",
+                snapshot_id,
+            )
+            return None
+
+        was_running = await self._is_main_container_running()
+        if was_running:
+            # Capture from a stopped container to avoid committing a filesystem
+            # that is still being mutated by background processes.
+            self.logger.info(
+                "Stopping main container before snapshot capture for stronger consistency: %s",
+                snapshot_id,
+            )
+            sync_result = await self.exec("sync")
+            if sync_result.return_code != 0:
+                self.logger.warning(
+                    "Filesystem sync before snapshot failed for %s: %s",
+                    snapshot_id,
+                    sync_result.stdout or sync_result.stderr or sync_result.return_code,
+                )
+            await self._run_docker_compose_command(
+                ["stop", "-t", str(self._SNAPSHOT_STOP_TIMEOUT_SEC), "main"],
+                check=True,
+            )
+            stopped_container_id = await self._get_main_container_id(include_stopped=True)
+            if stopped_container_id:
+                container_id = stopped_container_id
+
+        sanitized_snapshot = "".join(
+            c.lower() if c.isalnum() else "-"
+            for c in snapshot_id
+        ).strip("-")
+        if not sanitized_snapshot:
+            sanitized_snapshot = "snapshot"
+        image_tag = f"hbstate__{sanitized_snapshot}"
+
+        await self._run_docker_command(
+            ["commit", container_id, image_tag], check=True
+        )
+
+        inspect = await self._run_docker_command(
+            ["image", "inspect", "--format", "{{.Id}}", image_tag], check=True
+        )
+        image_ref = (inspect.stdout or "").strip() or image_tag
+
+        if archive_path is not None:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            await self._run_docker_command(
+                [
+                    "save",
+                    "-o",
+                    str(archive_path.resolve().absolute()),
+                    image_tag,
+                ],
+                check=True,
+            )
+
+        if restart_container and was_running:
+            self.logger.info(
+                "Restarting environment after snapshot capture so execution can continue: %s",
+                snapshot_id,
+            )
+            await self._run_docker_compose_command(
+                ["up", "--detach", "--wait"],
+                check=True,
+            )
+
+        return {
+            "snapshot_id": snapshot_id,
+            "image_tag": image_tag,
+            "image_ref": image_ref,
+            "archive_path": (
+                str(archive_path.resolve().absolute())
+                if archive_path is not None
+                else ""
+            ),
+        }

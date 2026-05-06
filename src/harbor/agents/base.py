@@ -81,6 +81,11 @@ class BaseAgent(ABC):
         """
         return f"{cls.__module__}:{cls.__name__}"
 
+    @classmethod
+    def supports_multiround(cls) -> bool:
+        """Whether the agent provides a dedicated multi-round implementation."""
+        return cls.run_round is not BaseAgent.run_round
+
     @abstractmethod
     async def setup(self, environment: BaseEnvironment) -> None:
         """
@@ -112,3 +117,26 @@ class BaseAgent(ABC):
             environment: The environment in which to complete the task.
             context: The context to populate with the results of the agent execution
         """
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """
+        Run the agent for a specific round in a multi-round task.
+
+        Default implementation delegates to run() for all rounds.
+        Subclasses can override to implement session continuity across rounds.
+
+        Args:
+            instruction: The instruction for this round.
+            round_num: 1-indexed round number.
+            environment: The environment.
+            context: The context to populate.
+        """
+        await self.run(
+            instruction=instruction, environment=environment, context=context
+        )

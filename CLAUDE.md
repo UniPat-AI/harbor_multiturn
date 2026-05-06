@@ -148,6 +148,61 @@ A task is a unit of evaluation defined in a directory with:
 - `tests/` - Verification scripts (test.sh writes reward to `/logs/verifier/reward.txt`)
 - `solution/` (optional) - Reference solution
 
+#### Multi-round Tasks
+
+Multi-round tasks consist of 3-5 sequential rounds executed in the same container. The agent maintains session continuity across rounds while `/app/` evolves in place.
+
+Directory structure:
+```
+my-task/
+├── task.toml                    # Shared config with [metadata.multiround]
+├── instruction.md               # Placeholder (required for validation)
+├── environment/Dockerfile       # Shared container definition
+├── round_1/
+│   ├── instruction.md           # Round 1 instructions
+│   ├── solution/solve.sh        # Round 1 oracle solution
+│   └── tests/test.sh            # Round 1 cumulative tests
+├── round_2/
+│   ├── instruction.md
+│   ├── solution/solve.sh
+│   └── tests/test.sh            # Round 1+2 cumulative tests
+└── round_3/
+    ├── instruction.md
+    ├── solution/solve.sh
+    └── tests/test.sh            # Round 1+2+3 cumulative tests
+```
+
+Multi-round CLI parameters:
+```bash
+# Limit max rounds
+harbor run --path ./my_task --max-round 2
+
+# Fast-forward to round N (uses oracle solve.sh for rounds 1..N-1)
+harbor run --path ./my_task --start-round 3
+
+# Resume from existing trial (backup + in-place re-run, -o auto-inferred)
+harbor run --path ./my_task --resume-trial ./jobs/xxx/trial_dir --resume-round 3
+
+# Keep more than one successful parent trajectory per round
+harbor run --path ./my_task -k 4 --multiround-continue-successes-per-round 2
+
+# Require snapshot-based restore and save snapshots for successful trials
+harbor run --path ./my_task -k 4 \
+  --multiround-state-cache-policy success \
+  --multiround-state-required
+
+# Combine parameters
+harbor run --path ./my_task --start-round 2 --max-round 4
+```
+
+Current multi-round behavior notes:
+- With `-k N`, Harbor runs `N` attempts in the current round. By default it only continues the first successful parent trajectory into the next round (`--multiround-continue-successes-per-round` defaults to `1`).
+- Resume prefers `state/round_N/snapshot.json` for the requested restore point and falls back to top-level `state/snapshot.json` as a latest-snapshot compatibility path. Snapshot capture uses `sync`, `docker compose stop main`, `docker commit`, `docker save`, and restarts the env when later rounds still need to run.
+- `--resume-trial` is only supported for a single task job. Dataset mode or multi-task runs reject it explicitly.
+- Resume requires a usable snapshot by default; only `--multiround-state-optional` allows fallback to cold-start.
+- Resume into `oracle` is only supported when the source trial also used `oracle`.
+- For Claude Code full-task, resume, and attempt-selection runs, successful final traces should keep clear `round=1/2/3...` tags and should not contain `null round` placeholders.
+
 ### Agents
 
 Agents implement `BaseAgent` (in `src/harbor/agents/base.py`):

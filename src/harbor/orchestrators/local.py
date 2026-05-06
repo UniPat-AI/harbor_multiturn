@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 
 from rich.console import Group
@@ -17,6 +18,7 @@ from rich.progress import (
 from harbor.metrics.base import BaseMetric
 from harbor.models.job.config import RetryConfig
 from harbor.models.orchestrator_type import OrchestratorType
+from harbor.models.task.task import Task
 from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from harbor.orchestrators.base import BaseOrchestrator
@@ -109,6 +111,49 @@ class LocalOrchestrator(BaseOrchestrator):
             self._retry_config.wait_multiplier**attempt
         )
         return min(delay, self._retry_config.max_wait_sec)
+
+    @staticmethod
+    def _is_plain_quiet_progress_enabled() -> bool:
+        return os.getenv("HARBOR_PLAIN_QUIET_PROGRESS", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+
+    def _all_trial_tasks_are_multiround(self) -> bool:
+        return bool(self._trial_configs) and all(
+            Task(trial_config.task.path).is_multiround
+            for trial_config in self._trial_configs
+        )
+
+    def _should_use_plain_quiet_progress(self) -> bool:
+        return (
+            self._quiet
+            and self._is_plain_quiet_progress_enabled()
+            and self._all_trial_tasks_are_multiround()
+        )
+
+    @staticmethod
+    def _trial_progress_reward(result: TrialResult) -> float | int | None:
+        rewards = result.verifier_result.rewards if result.verifier_result else None
+        if not rewards:
+            return None
+        final_reward = rewards.get("reward")
+        return (
+            final_reward
+            if isinstance(final_reward, int | float)
+            else None
+        )
+
+    @classmethod
+    def _trial_progress_status(cls, result: TrialResult) -> str:
+        if result.exception_info is not None:
+            return "error"
+        final_reward = cls._trial_progress_reward(result)
+        if final_reward is None:
+            return "ok"
+        return "ok" if float(final_reward) > 0 else "failed"
 
     async def _execute_trial_with_retries(
         self,
@@ -247,6 +292,51 @@ class LocalOrchestrator(BaseOrchestrator):
         self,
         semaphore: asyncio.Semaphore,
         trial_config: TrialConfig,
+        completion_lock: asyncio.Lock,
+        total_trials: int,
+    ) -> TrialResult:
+        async with semaphore:
+            result = await self._execute_trial_with_retries(trial_config)
+        async with completion_lock:
+            self._trial_results.append(result)
+            completed = len(self._trial_results)
+
+            metric_suffix = ""
+            if self._metrics:
+                rewards = [
+                    trial_result.verifier_result.rewards
+                    if trial_result.verifier_result is not None
+                    else None
+                    for trial_result in self._trial_results
+                ]
+                metric_result = self._metrics[trial_config.task.source or "adhoc"][
+                    0
+                ].compute(rewards)
+                first_metric_name, first_metric_value = next(iter(metric_result.items()))
+                metric_suffix = (
+                    f" | {first_metric_name.title()}: {first_metric_value:.3f}"
+                )
+
+            trial_status = self._trial_progress_status(result)
+            reward_suffix = ""
+            trial_reward = self._trial_progress_reward(result)
+            if trial_reward is not None:
+                reward_suffix = f" | reward={float(trial_reward):.3f}"
+            self._logger.info(
+                "[progress] %s/%s done | status=%s%s | trial=%s%s",
+                completed,
+                total_trials,
+                trial_status,
+                reward_suffix,
+                trial_config.trial_name,
+                metric_suffix,
+            )
+        return result
+
+    async def _run_trial_quiet_progress(
+        self,
+        semaphore: asyncio.Semaphore,
+        trial_config: TrialConfig,
         loading_progress: Progress,
         loading_progress_task: TaskID,
     ) -> TrialResult:
@@ -283,16 +373,37 @@ class LocalOrchestrator(BaseOrchestrator):
     async def run(self) -> list[TrialResult]:
         semaphore = asyncio.Semaphore(self._n_concurrent_trials)
 
-        loading_progress = Progress(
-            SpinnerColumn(),
-            MofNCompleteColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        )
+        if self._should_use_plain_quiet_progress():
+            completion_lock = asyncio.Lock()
+            total_trials = len(self._trial_configs)
+            self._logger.info(
+                "Running %s trial(s) with quiet progress mode",
+                total_trials,
+            )
+
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(
+                        self._run_trial_quiet(
+                            semaphore,
+                            trial_config,
+                            completion_lock,
+                            total_trials,
+                        )
+                    )
+                    for trial_config in self._trial_configs
+                ]
+            return [task.result() for task in tasks]
 
         if self._quiet:
+            loading_progress = Progress(
+                SpinnerColumn(),
+                MofNCompleteColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            )
             with loading_progress:
                 progress_task = loading_progress.add_task(
                     "Running trials...", total=len(self._trial_configs)
@@ -301,7 +412,7 @@ class LocalOrchestrator(BaseOrchestrator):
                 async with asyncio.TaskGroup() as tg:
                     tasks = [
                         tg.create_task(
-                            self._run_trial_quiet(
+                            self._run_trial_quiet_progress(
                                 semaphore,
                                 trial_config,
                                 loading_progress,
@@ -311,30 +422,38 @@ class LocalOrchestrator(BaseOrchestrator):
                         for trial_config in self._trial_configs
                     ]
                 return [task.result() for task in tasks]
-        else:
-            running_progress = Progress(
-                SpinnerColumn(),
-                TimeElapsedColumn(),
-                TextColumn("[progress.description]{task.description}"),
+
+        loading_progress = Progress(
+            SpinnerColumn(),
+            MofNCompleteColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        )
+        running_progress = Progress(
+            SpinnerColumn(),
+            TimeElapsedColumn(),
+            TextColumn("[progress.description]{task.description}"),
+        )
+
+        with Live(Group(loading_progress, running_progress), refresh_per_second=10):
+            progress_task = loading_progress.add_task(
+                "Running trials...", total=len(self._trial_configs)
             )
 
-            with Live(Group(loading_progress, running_progress), refresh_per_second=10):
-                progress_task = loading_progress.add_task(
-                    "Running trials...", total=len(self._trial_configs)
-                )
-
-                async with asyncio.TaskGroup() as tg:
-                    tasks = [
-                        tg.create_task(
-                            self._run_trial(
-                                semaphore,
-                                trial_config,
-                                loading_progress,
-                                progress_task,
-                                running_progress,
-                            )
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(
+                        self._run_trial(
+                            semaphore,
+                            trial_config,
+                            loading_progress,
+                            progress_task,
+                            running_progress,
                         )
-                        for trial_config in self._trial_configs
-                    ]
+                    )
+                    for trial_config in self._trial_configs
+                ]
 
-            return [task.result() for task in tasks]
+        return [task.result() for task in tasks]

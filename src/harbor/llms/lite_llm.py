@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,25 @@ class LiteLLM(BaseLLM):
 
         self._use_responses_api = use_responses_api
         self._structured_response_prompt_template = STRUCTURED_RESPONSE_PROMPT_TEMPLATE
+
+    def _is_mindra_opus_47(self) -> bool:
+        model = self._model_name.lower()
+        api_base = (self._api_base or "").lower()
+        return "claude-opus-4-7" in model and "mindracode" in api_base
+
+    def _apply_mindra_opus_47_thinking(self, completion_kwargs: dict[str, Any]) -> None:
+        effort = self._reasoning_effort or os.environ.get("REASONING_EFFORT") or "high"
+        if effort == "none":
+            effort = "high"
+
+        completion_kwargs.pop("reasoning_effort", None)
+        completion_kwargs.pop("temperature", None)
+
+        extra_body_val = completion_kwargs.get("extra_body")
+        extra_body = extra_body_val if isinstance(extra_body_val, dict) else {}
+        extra_body["thinking"] = {"type": "adaptive"}
+        extra_body["output_config"] = {"effort": effort}
+        completion_kwargs["extra_body"] = extra_body
 
     @property
     def _lookup_model_name(self) -> str:
@@ -303,10 +323,11 @@ class LiteLLM(BaseLLM):
             completion_kwargs = {
                 **self._build_base_kwargs(logging_path),
                 "messages": messages,
-                "temperature": self._temperature,
                 "response_format": response_format,
                 "reasoning_effort": self._reasoning_effort,
             }
+            # Some reasoning models (e.g. claude-opus-4-7) reject temperature;
+            # skip temperature entirely and let the API use its default.
 
             # Add logprobs and return_token_ids if rollout details collection is enabled
             if self._collect_rollout_details:
@@ -331,6 +352,8 @@ class LiteLLM(BaseLLM):
             elif "extra_body" in kwargs:
                 kwargs["extra_body"] = {**kwargs["extra_body"]}
             completion_kwargs.update(kwargs)
+            if self._is_mindra_opus_47():
+                self._apply_mindra_opus_47_thinking(completion_kwargs)
 
             # Add thinking parameter for Anthropic models if max_thinking_tokens is set
             if self._max_thinking_tokens is not None and (

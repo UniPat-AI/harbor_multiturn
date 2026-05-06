@@ -10,11 +10,14 @@ class Sum(BaseMetric[dict[str, float | int]]):
         for reward in rewards:
             if reward is None:
                 values.append(0)
-            elif len(reward) != 1:
-                raise ValueError(
-                    f"Expected exactly one key in reward dictionary, got {len(reward)}"
-                )
-            else:
+            elif len(reward) == 1:
                 values.extend(reward.values())
+            elif "reward" in reward:
+                values.append(reward["reward"])
+            else:
+                raise ValueError(
+                    f"Expected exactly one key or a 'reward' key in reward "
+                    f"dictionary, got keys: {list(reward.keys())}"
+                )
 
         return {"sum": sum(values)}

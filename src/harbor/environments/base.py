@@ -73,6 +73,7 @@ class BaseEnvironment(ABC):
         self._override_storage_mb = override_storage_mb
         self._override_gpus = override_gpus
         self._suppress_override_warnings = suppress_override_warnings
+        self.restored_from_snapshot = False
 
         self.logger = (logger or global_logger).getChild(__name__)
 
@@ -260,3 +261,15 @@ class BaseEnvironment(ABC):
     async def attach(self) -> None:
         """Attaches to the environment using os.execvp."""
         raise NotImplementedError("This environment does not support attaching.")
+
+    async def capture_state_snapshot(
+        self,
+        snapshot_id: str,
+        archive_path: Path | None = None,
+        restart_container: bool = False,
+    ) -> dict[str, str] | None:
+        """Best-effort environment state snapshot hook.
+
+        Environment implementations that support state snapshots can override this.
+        """
+        return None

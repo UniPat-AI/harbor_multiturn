@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,9 @@ from harbor.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from harbor.environments.base import BaseEnvironment
 from harbor.models.trial.paths import EnvironmentPaths
+from harbor.utils.templating import render_prompt_template
 
 
 class ClaudeCode(BaseInstalledAgent):
@@ -33,6 +36,9 @@ class ClaudeCode(BaseInstalledAgent):
         super().__init__(*args, **kwargs)
         self._max_thinking_tokens = max_thinking_tokens
         self._max_turns = max_turns
+        # Track round start timestamps for multi-round trajectory annotation
+        # List of (round_num, iso_timestamp) pairs, sorted by timestamp
+        self._round_starts: list[tuple[int, str]] = []
 
     @staticmethod
     def name() -> str:
@@ -179,6 +185,20 @@ class ClaudeCode(BaseInstalledAgent):
             return step
 
         raise ValueError(f"Unsupported event kind '{kind}'")
+
+    def _get_round_for_timestamp(self, ts: str | None) -> int | None:
+        """Return the round number for a given ISO timestamp, or None if not multi-round."""
+        if not self._round_starts or ts is None:
+            return None
+        # _round_starts is sorted by invocation order (ascending time).
+        # Find the last round whose start_time <= ts.
+        result = None
+        for round_num, start_ts in self._round_starts:
+            if start_ts <= ts:
+                result = round_num
+            else:
+                break
+        return result
 
     @staticmethod
     def _stringify(value: Any) -> str:
@@ -641,6 +661,14 @@ class ClaudeCode(BaseInstalledAgent):
             if step.source == "agent" and not step.model_name and default_model_name:
                 step.model_name = default_model_name
 
+            # Inject round number for multi-round tasks
+            round_num = self._get_round_for_timestamp(step.timestamp)
+            if round_num is not None:
+                if step.extra is None:
+                    step.extra = {"round": round_num}
+                else:
+                    step.extra["round"] = round_num
+
             steps.append(step)
 
         if not steps:
@@ -803,9 +831,8 @@ class ClaudeCode(BaseInstalledAgent):
             return True
         return False
 
-    def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
-        escaped_instruction = shlex.quote(instruction)
-
+    def _build_env(self) -> dict[str, str]:
+        """Build environment variables dict for Claude Code execution."""
         use_bedrock = self._is_bedrock_mode()
 
         env = {
@@ -904,6 +931,10 @@ class ClaudeCode(BaseInstalledAgent):
 
         env["CLAUDE_CONFIG_DIR"] = (EnvironmentPaths.agent_dir / "sessions").as_posix()
 
+        return env
+
+    def _build_setup_command(self) -> str:
+        """Build the setup shell command (mkdir, skills, MCP registration)."""
         setup_command = (
             "mkdir -p $CLAUDE_CONFIG_DIR/debug $CLAUDE_CONFIG_DIR/projects/-app "
             "$CLAUDE_CONFIG_DIR/shell-snapshots $CLAUDE_CONFIG_DIR/statsig "
@@ -921,12 +952,22 @@ class ClaudeCode(BaseInstalledAgent):
         if mcp_command:
             setup_command += f" && {mcp_command}"
 
-        max_turns_flag = ""
+        return setup_command
+
+    def _build_max_turns_flag(self) -> str:
+        """Build the ``--max-turns`` CLI flag string (empty if not configured)."""
         max_turns = self._max_turns
         if max_turns is None and "CLAUDE_CODE_MAX_TURNS" in os.environ:
             max_turns = int(os.environ["CLAUDE_CODE_MAX_TURNS"])
         if max_turns is not None:
-            max_turns_flag = f"--max-turns {max_turns}"
+            return f"--max-turns {max_turns}"
+        return ""
+
+    def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
+        escaped_instruction = shlex.quote(instruction)
+        env = self._build_env()
+        setup_command = self._build_setup_command()
+        max_turns_flag = self._build_max_turns_flag()
 
         return [
             ExecInput(
@@ -945,3 +986,92 @@ class ClaudeCode(BaseInstalledAgent):
                 env=env,
             ),
         ]
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Run Claude Code for a specific round with session continuity.
+
+        Round 1: normal setup + ``claude --print``
+        Round 2+: ``claude --continue --print`` (reuses previous session)
+
+        Does NOT call ``populate_context_post_run()`` — the Trial calls it
+        once after all rounds complete, reading every JSONL file to build
+        the full trajectory.
+        """
+        self._round_starts.append((round_num, datetime.now(timezone.utc).isoformat()))
+        rendered_instruction = (
+            render_prompt_template(self._prompt_template_path, instruction)
+            if self._prompt_template_path
+            else instruction
+        )
+        escaped_instruction = shlex.quote(rendered_instruction)
+
+        env = self._build_env()
+        max_turns_flag = self._build_max_turns_flag()
+
+        commands: list[ExecInput] = []
+
+        if round_num == 1:
+            # Round 1: setup directories + normal claude invocation
+            commands.append(ExecInput(command=self._build_setup_command(), env=env))
+            commands.append(
+                ExecInput(
+                    command=(
+                        'export PATH="$HOME/.local/bin:$PATH"; '
+                        f"claude --verbose --output-format=stream-json "
+                        f"--permission-mode=bypassPermissions "
+                        f"{max_turns_flag} "
+                        f"--print -- {escaped_instruction} 2>&1 </dev/null | "
+                        f"stdbuf -oL tee /logs/agent/claude-code.txt"
+                    ),
+                    env=env,
+                )
+            )
+        else:
+            # Round 2+: use --continue to extend the previous conversation
+            log_file = f"claude-code-round-{round_num}.txt"
+            commands.append(
+                ExecInput(
+                    command=(
+                        'export PATH="$HOME/.local/bin:$PATH"; '
+                        f"claude --continue --verbose --output-format=stream-json "
+                        f"--permission-mode=bypassPermissions "
+                        f"{max_turns_flag} "
+                        f"--print -- {escaped_instruction} 2>&1 </dev/null | "
+                        f"stdbuf -oL tee /logs/agent/{log_file}"
+                    ),
+                    env=env,
+                )
+            )
+
+        # Execute commands (replicates BaseInstalledAgent.run() exec logic,
+        # but uses round-prefixed directories and skips populate_context_post_run)
+        for i, exec_input in enumerate(commands):
+            command_dir = self.logs_dir / f"round-{round_num}-command-{i}"
+            command_dir.mkdir(parents=True, exist_ok=True)
+            (command_dir / "command.txt").write_text(exec_input.command)
+
+            cmd_env = exec_input.env
+            if self._extra_env:
+                cmd_env = dict(exec_input.env) if exec_input.env else {}
+                cmd_env.update(self._extra_env)
+
+            result = await environment.exec(
+                command=exec_input.command,
+                cwd=exec_input.cwd,
+                env=cmd_env,
+                timeout_sec=exec_input.timeout_sec,
+            )
+
+            (command_dir / "return-code.txt").write_text(str(result.return_code))
+
+            if result.stdout:
+                (command_dir / "stdout.txt").write_text(result.stdout)
+
+            if result.stderr:
+                (command_dir / "stderr.txt").write_text(result.stderr)

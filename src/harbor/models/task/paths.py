@@ -1,3 +1,5 @@
+import re
+import tomllib
 from pathlib import Path
 
 
@@ -62,11 +64,77 @@ class TaskPaths:
         """Path to the test.sh file."""
         return self.tests_dir / "test.sh"
 
+    # ---- Multi-round path helpers ----
+
+    def round_dir(self, round_num: int) -> Path:
+        """Path to the round_N/ directory."""
+        return self.task_dir / f"round_{round_num}"
+
+    def round_numbers(self) -> list[int]:
+        """Sorted list of round numbers present under round_N/ directories."""
+        round_numbers: list[int] = []
+        for path in self.task_dir.iterdir():
+            if not path.is_dir():
+                continue
+            match = re.fullmatch(r"round_(\d+)", path.name)
+            if match is not None:
+                round_numbers.append(int(match.group(1)))
+        return sorted(round_numbers)
+
+    def round_instruction_path(self, round_num: int) -> Path:
+        """Path to round_N/instruction.md."""
+        return self.round_dir(round_num) / "instruction.md"
+
+    def round_solution_dir(self, round_num: int) -> Path:
+        """Path to round_N/solution/."""
+        return self.round_dir(round_num) / "solution"
+
+    def round_solve_path(self, round_num: int) -> Path:
+        """Path to round_N/solution/solve.sh."""
+        return self.round_solution_dir(round_num) / "solve.sh"
+
+    def round_tests_dir(self, round_num: int) -> Path:
+        """Path to round_N/tests/."""
+        return self.round_dir(round_num) / "tests"
+
+    def round_test_path(self, round_num: int) -> Path:
+        """Path to round_N/tests/test.sh."""
+        return self.round_tests_dir(round_num) / "test.sh"
+
+    def _declares_multiround(self) -> bool:
+        """Check whether task.toml explicitly declares multi-round metadata."""
+        if not self.config_path.exists():
+            return False
+
+        try:
+            config = tomllib.loads(self.config_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            return False
+
+        metadata = config.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+
+        multiround = metadata.get("multiround")
+        if not isinstance(multiround, dict):
+            return False
+
+        num_rounds = multiround.get("num_rounds")
+        return isinstance(num_rounds, int) and num_rounds > 1
+
+    def _has_multiround_tests(self) -> bool:
+        """Check if this looks like a declared multi-round task with round tests."""
+        return self._declares_multiround() and self.round_test_path(1).exists()
+
     def is_valid(self, disable_verification: bool = False) -> bool:
         """Validate that the task directory is a valid task directory."""
         return (
             self.config_path.exists()
             and self.environment_dir.exists()
             and self.instruction_path.exists()
-            and (disable_verification or self.test_path.exists())
+            and (
+                disable_verification
+                or self.test_path.exists()
+                or self._has_multiround_tests()
+            )
         )

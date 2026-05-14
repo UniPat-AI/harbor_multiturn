@@ -72,6 +72,37 @@ change_types = ["extension", "correction"]
     assert task.round_change_type_label(2) == "extension+correction"
 
 
+def test_task_checksum_ignores_terminal_marker_files(tmp_path):
+    task_dir = _write_task(
+        tmp_path,
+        """
+version = "1.0"
+
+[metadata.multiround]
+num_rounds = 2
+
+[[metadata.multiround.rounds]]
+round = 1
+change_types = ["extension"]
+
+[[metadata.multiround.rounds]]
+round = 2
+change_types = ["correction"]
+""",
+    )
+
+    baseline = Task(task_dir).checksum
+
+    (task_dir / "passed.txt").write_text("")
+    (task_dir / "conditionally_passed.txt").write_text("")
+    (task_dir / "failed.txt").write_text("reason\n")
+    (task_dir / "round_1" / "passed.txt").write_text("")
+    (task_dir / "round_1" / "conditionally_passed.txt").write_text("")
+    (task_dir / "round_2" / "failed.txt").write_text("reason\n")
+
+    assert Task(task_dir).checksum == baseline
+
+
 def test_task_rejects_duplicate_change_types(tmp_path):
     task_dir = _write_task(
         tmp_path,

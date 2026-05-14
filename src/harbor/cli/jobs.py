@@ -52,7 +52,9 @@ _VOLATILE_TASK_DIR_NAMES = {
 }
 _VOLATILE_TASK_FILE_NAMES = {
     ".env",
+    "conditionally_passed.txt",
     "creating_jobs_latest.txt",
+    "failed.txt",
     "passed.txt",
 }
 

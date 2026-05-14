@@ -6,6 +6,7 @@ import pytest
 
 from harbor.cli.jobs import (
     _cleanup_trial_for_resume,
+    _compute_task_definition_checksum,
     _resolve_resume_trial_dir,
     _would_enable_roundwise_multiround_attempt_selection,
     start,
@@ -151,6 +152,22 @@ def _write_multiround_task(task_dir: Path, *, num_rounds: int = 3) -> None:
         f"[metadata.multiround]\nnum_rounds = {num_rounds}\n\n"
         + "\n".join(rounds)
     )
+
+
+def test_resume_task_definition_checksum_ignores_terminal_marker_files(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=2)
+
+    baseline = _compute_task_definition_checksum(task_dir)
+
+    (task_dir / "passed.txt").write_text("")
+    (task_dir / "conditionally_passed.txt").write_text("")
+    (task_dir / "failed.txt").write_text("reason\n")
+    (task_dir / "round_1" / "passed.txt").write_text("")
+    (task_dir / "round_1" / "conditionally_passed.txt").write_text("")
+    (task_dir / "round_2" / "failed.txt").write_text("reason\n")
+
+    assert _compute_task_definition_checksum(task_dir) == baseline
 
 
 def test_validate_resume_agent_transition_allows_oracle_to_oracle(tmp_path: Path):

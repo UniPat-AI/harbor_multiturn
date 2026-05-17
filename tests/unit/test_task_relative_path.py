@@ -75,3 +75,32 @@ num_rounds = 2
         (round_dir / "tests" / "test.sh").write_text("#!/usr/bin/env sh\n")
 
     assert TaskPaths(task_dir).is_valid() is True
+
+
+def test_task_paths_accept_in_progress_one_round_multiround_task(tmp_path):
+    task_dir = tmp_path / "multi-task-one-round"
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "instruction.md").write_text("Task\n")
+    (task_dir / "task.toml").write_text(
+        """
+version = "1.0"
+
+[metadata.multiround]
+num_rounds = 1
+
+[[metadata.multiround.rounds]]
+round = 1
+change_types = ["extension"]
+""".strip()
+    )
+
+    round_dir = task_dir / "round_1"
+    (round_dir / "solution").mkdir(parents=True)
+    (round_dir / "tests").mkdir(parents=True)
+    (round_dir / "instruction.md").write_text("Round 1\n")
+    (round_dir / "solution" / "solve.sh").write_text("#!/usr/bin/env sh\n")
+    (round_dir / "tests" / "test.sh").write_text("#!/usr/bin/env sh\n")
+
+    assert TaskPaths(task_dir).is_valid() is True
+    assert Task(task_dir).is_multiround is True
+    assert Task(task_dir).num_rounds == 1

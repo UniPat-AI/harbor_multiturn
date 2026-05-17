@@ -120,7 +120,7 @@ class TaskPaths:
             return False
 
         num_rounds = multiround.get("num_rounds")
-        return isinstance(num_rounds, int) and num_rounds > 1
+        return isinstance(num_rounds, int) and num_rounds >= 1
 
     def _has_multiround_tests(self) -> bool:
         """Check if this looks like a declared multi-round task with round tests."""

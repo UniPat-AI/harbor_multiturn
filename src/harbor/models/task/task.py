@@ -102,7 +102,7 @@ class Task:
     def is_multiround(self) -> bool:
         """Check if this task is a multi-round task."""
         multiround = self.config.metadata.get("multiround")
-        return multiround is not None and multiround.get("num_rounds", 0) > 1
+        return multiround is not None and multiround.get("num_rounds", 0) >= 1
 
     @property
     def num_rounds(self) -> int:

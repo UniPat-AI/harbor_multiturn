@@ -208,6 +208,7 @@ __marimo__/
 
 
 jobs/
+harbor_jobs/
 trials/
 *.ipynb
 /tasks/

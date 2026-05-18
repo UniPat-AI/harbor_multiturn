@@ -56,6 +56,15 @@ class _BuildConflictError(RuntimeError):
     """
 
 
+def _new_async_client(**kwargs) -> httpx.AsyncClient:
+    try:
+        return httpx.AsyncClient(**kwargs)
+    except ImportError as exc:
+        if "SOCKS proxy" not in str(exc) or "trust_env" in kwargs:
+            raise
+        return httpx.AsyncClient(**kwargs, trust_env=False)
+
+
 class NovitaEnvironment(BaseEnvironment):
     """
     Novita cloud sandbox environment.
@@ -136,7 +145,7 @@ class NovitaEnvironment(BaseEnvironment):
         self._api_base_url = os.environ.get(
             "NOVITA_BASE_URL", self._DEFAULT_API_BASE_URL
         )
-        self._http_client = httpx.AsyncClient(
+        self._http_client = _new_async_client(
             base_url=self._api_base_url,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
@@ -242,7 +251,7 @@ class NovitaEnvironment(BaseEnvironment):
             return info["downloadUrl"]
 
         # Upload to S3 via pre-signed PUT URL (no Authorization header)
-        async with httpx.AsyncClient(timeout=300.0) as upload_client:
+        async with _new_async_client(timeout=300.0) as upload_client:
             put_resp = await upload_client.put(
                 info["uploadUrl"],
                 content=data,

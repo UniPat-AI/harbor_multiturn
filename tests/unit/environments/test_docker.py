@@ -346,9 +346,10 @@ class TestChownBeforeDownload:
 
         await docker_env.download_dir("/logs", "/local/logs")
 
-        assert len(calls) == 2
-        assert calls[0] == "exec:chown -R 501:20 /logs"
-        assert calls[1].startswith("compose:")
+        assert len(calls) == 3
+        assert calls[0] == "exec:chmod -R u+rwX,go+rX /logs"
+        assert calls[1] == "exec:chown -R 501:20 /logs"
+        assert calls[2].startswith("compose:")
 
     @patch(
         "harbor.environments.docker.docker.os.getuid", create=True, return_value=1000
@@ -474,6 +475,8 @@ class TestStopChownBindMounts:
 
         async def track_compose(command, **kwargs):
             calls.append(f"compose:{command}")
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
             return ExecResult(return_code=0)
 
         docker_env.exec = AsyncMock(side_effect=track_exec)
@@ -481,12 +484,18 @@ class TestStopChownBindMounts:
 
         await docker_env.stop(delete=False)
 
-        assert calls[:3] == [
+        assert calls[0] == "compose:['ps', '-q', 'main']"
+        assert calls[1:4] == [
             "exec:chown -R 1000:1000 /logs/verifier",
             "exec:chown -R 1000:1000 /logs/agent",
             "exec:chown -R 1000:1000 /logs/artifacts",
         ]
-        assert any("compose:['down']" in c for c in calls[3:])
+        assert calls[4:7] == [
+            "exec:chmod -R u+rwX,go+rX /logs/verifier",
+            "exec:chmod -R u+rwX,go+rX /logs/agent",
+            "exec:chmod -R u+rwX,go+rX /logs/artifacts",
+        ]
+        assert any("compose:['down']" in c for c in calls[7:])
 
     @patch(
         "harbor.environments.docker.docker.os.getuid", create=True, return_value=1000
@@ -499,13 +508,16 @@ class TestStopChownBindMounts:
         docker_env.exec = AsyncMock(
             return_value=ExecResult(return_code=1, stdout="Operation not permitted")
         )
-        docker_env._run_docker_compose_command = AsyncMock(
-            return_value=ExecResult(return_code=0)
-        )
+        async def track_compose(command, **kwargs):
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            return ExecResult(return_code=0)
+
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
 
         await docker_env.stop(delete=False)
 
-        docker_env._run_docker_compose_command.assert_called_once_with(["down"])
+        docker_env._run_docker_compose_command.assert_any_call(["down"])
 
 
 class TestPrepareLogsForHost:
@@ -559,14 +571,155 @@ class TestPrepareLogsForHost:
         self, _getgid, _getuid, docker_env
     ):
         """stop() should call prepare_logs_for_host() so the chown happens once."""
-        docker_env._run_docker_compose_command = AsyncMock(
-            return_value=ExecResult(return_code=0)
-        )
+        async def track_compose(command, **kwargs):
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            return ExecResult(return_code=0)
+
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
         docker_env.prepare_logs_for_host = AsyncMock()
 
         await docker_env.stop(delete=False)
 
         docker_env.prepare_logs_for_host.assert_called_once()
+
+
+class TestCaptureStateSnapshot:
+    """Tests for consistent snapshot capture from Docker environments."""
+
+    async def test_capture_snapshot_stops_running_container_before_commit(self, docker_env):
+        """capture_state_snapshot should sync, stop, then commit the stopped container."""
+        compose_calls = []
+        docker_calls = []
+
+        async def track_compose(command, **kwargs):
+            compose_calls.append(command)
+            if command == ["ps", "-a", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            return ExecResult(return_code=0)
+
+        async def track_docker(command, **kwargs):
+            docker_calls.append(command)
+            if command[:3] == ["image", "inspect", "--format"]:
+                return ExecResult(return_code=0, stdout="sha256:imageid\n")
+            return ExecResult(return_code=0)
+
+        docker_env.exec = AsyncMock(return_value=ExecResult(return_code=0))
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
+        docker_env._run_docker_command = AsyncMock(side_effect=track_docker)
+
+        archive_path = docker_env.trial_paths.state_dir / "snapshot-image.tar"
+        result = await docker_env.capture_state_snapshot(
+            snapshot_id="trial__state",
+            archive_path=archive_path,
+        )
+
+        assert result is not None
+        assert compose_calls == [
+            ["ps", "-a", "-q", "main"],
+            ["ps", "-q", "main"],
+            ["stop", "-t", "30", "main"],
+            ["ps", "-a", "-q", "main"],
+        ]
+        docker_env.exec.assert_called_once_with("sync")
+        assert docker_calls[0] == ["commit", "container123", "hbstate__trial--state"]
+        assert docker_calls[1][:3] == ["image", "inspect", "--format"]
+        assert docker_calls[2][:2] == ["save", "-o"]
+
+    async def test_capture_snapshot_commits_stopped_container_without_extra_stop(
+        self, docker_env
+    ):
+        """capture_state_snapshot should commit an already-stopped container directly."""
+        compose_calls = []
+        docker_calls = []
+
+        async def track_compose(command, **kwargs):
+            compose_calls.append(command)
+            if command == ["ps", "-a", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="")
+            return ExecResult(return_code=0)
+
+        async def track_docker(command, **kwargs):
+            docker_calls.append(command)
+            if command[:3] == ["image", "inspect", "--format"]:
+                return ExecResult(return_code=0, stdout="sha256:imageid\n")
+            return ExecResult(return_code=0)
+
+        docker_env.exec = AsyncMock(return_value=ExecResult(return_code=0))
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
+        docker_env._run_docker_command = AsyncMock(side_effect=track_docker)
+
+        result = await docker_env.capture_state_snapshot(snapshot_id="trial__state")
+
+        assert result is not None
+        assert compose_calls == [
+            ["ps", "-a", "-q", "main"],
+            ["ps", "-q", "main"],
+        ]
+        docker_env.exec.assert_not_called()
+        assert docker_calls[0] == ["commit", "container123", "hbstate__trial--state"]
+
+    async def test_capture_snapshot_returns_none_when_container_missing(self, docker_env):
+        """capture_state_snapshot should return None when no main container exists."""
+
+        async def track_compose(command, **kwargs):
+            assert command == ["ps", "-a", "-q", "main"]
+            return ExecResult(return_code=0, stdout="")
+
+        docker_env.exec = AsyncMock(return_value=ExecResult(return_code=0))
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
+        docker_env._run_docker_command = AsyncMock(return_value=ExecResult(return_code=0))
+
+        result = await docker_env.capture_state_snapshot(snapshot_id="trial__state")
+
+        assert result is None
+        docker_env.exec.assert_not_called()
+        docker_env._run_docker_command.assert_not_called()
+
+    async def test_capture_snapshot_restarts_container_when_requested(self, docker_env):
+        """capture_state_snapshot should bring the environment back when requested."""
+        compose_calls = []
+        docker_calls = []
+
+        async def track_compose(command, **kwargs):
+            compose_calls.append(command)
+            if command == ["ps", "-a", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            if command == ["ps", "-q", "main"]:
+                return ExecResult(return_code=0, stdout="container123\n")
+            return ExecResult(return_code=0)
+
+        async def track_docker(command, **kwargs):
+            docker_calls.append(command)
+            if command[:3] == ["image", "inspect", "--format"]:
+                return ExecResult(return_code=0, stdout="sha256:imageid\n")
+            return ExecResult(return_code=0)
+
+        docker_env.exec = AsyncMock(return_value=ExecResult(return_code=0))
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
+        docker_env._run_docker_command = AsyncMock(side_effect=track_docker)
+
+        archive_path = docker_env.trial_paths.state_dir / "snapshot-image.tar"
+        result = await docker_env.capture_state_snapshot(
+            snapshot_id="trial__state",
+            archive_path=archive_path,
+            restart_container=True,
+        )
+
+        assert result is not None
+        assert compose_calls == [
+            ["ps", "-a", "-q", "main"],
+            ["ps", "-q", "main"],
+            ["stop", "-t", "30", "main"],
+            ["ps", "-a", "-q", "main"],
+            ["up", "--detach", "--wait"],
+        ]
+        docker_env.exec.assert_called_once_with("sync")
+        assert docker_calls[0] == ["commit", "container123", "hbstate__trial--state"]
 
 
 class TestIsMultiContainer:

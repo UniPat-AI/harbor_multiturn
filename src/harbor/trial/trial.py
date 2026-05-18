@@ -1,12 +1,15 @@
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
+import os
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from harbor.agents.factory import AgentFactory
 from harbor.environments.base import BaseEnvironment
@@ -21,6 +24,7 @@ from harbor.models.task.verifier_mode import (
 from harbor.models.trial.config import ArtifactConfig, ServiceVolumeConfig, TrialConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.models.trial.result import (
+    EnvironmentStateInfo,
     ExceptionInfo,
     StepResult,
     TimingInfo,
@@ -51,6 +55,15 @@ class Trial(ABC):
     """
 
     _AGENT_SETUP_TIMEOUT_SEC = 360
+    _CLAUDE_ROUND_STARTS_FILENAME = ".harbor-round-starts.json"
+    _MULTIROUND_VERIFIER_ARTIFACT_NAMES = (
+        "test-stdout.txt",
+        "test-stderr.txt",
+        "test-exit-code.txt",
+        "verification-error.txt",
+        "reward.txt",
+        "reward.json",
+    )
 
     def __init__(
         self,
@@ -85,7 +98,20 @@ class Trial(ABC):
         self._init_logger()
         self._init_timeouts()
         self._init_agent()
+        (
+            self._resume_state_image_ref,
+            self._resume_state_archive_path,
+            self._resume_state_snapshot_id,
+        ) = self._resolve_resume_state()
+        self._latest_snapshot_parent_id = self._resume_state_snapshot_id
         self._init_agent_environment()
+        capture_state_snapshot = getattr(
+            type(self.agent_environment), "capture_state_snapshot", None
+        )
+        self._environment_supports_state_snapshots = (
+            capture_state_snapshot is not None
+            and capture_state_snapshot is not BaseEnvironment.capture_state_snapshot
+        )
         self._init_artifact_handler()
 
     @property
@@ -196,6 +222,245 @@ class Trial(ABC):
 
         self.result.exception_info = ExceptionInfo.from_exception(exc)
         self.paths.exception_message_path.write_text(traceback.format_exc())
+
+    @property
+    def _task(self) -> Task:
+        """Compatibility alias for local multi-round helpers."""
+        return self.task
+
+    @_task.setter
+    def _task(self, value: Task) -> None:
+        self.task = value
+
+    @property
+    def _trial_paths(self) -> TrialPaths:
+        """Compatibility alias for local multi-round helpers."""
+        return self.paths
+
+    @_trial_paths.setter
+    def _trial_paths(self, value: TrialPaths) -> None:
+        self.paths = value
+
+    @property
+    def _agent(self):
+        """Compatibility alias for local multi-round helpers."""
+        return self.agent
+
+    @_agent.setter
+    def _agent(self, value) -> None:
+        self.agent = value
+
+    @property
+    def _environment(self) -> BaseEnvironment:
+        """Compatibility alias for local multi-round helpers."""
+        return self.agent_environment
+
+    @_environment.setter
+    def _environment(self, value: BaseEnvironment) -> None:
+        self.agent_environment = value
+
+    @property
+    def _logger(self) -> logging.Logger:
+        """Compatibility alias for local multi-round helpers."""
+        return self.logger
+
+    @_logger.setter
+    def _logger(self, value: logging.Logger) -> None:
+        self.logger = value
+
+    @staticmethod
+    def _is_plain_quiet_progress_enabled() -> bool:
+        return os.getenv("HARBOR_PLAIN_QUIET_PROGRESS", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+
+    def _multiround_trial_prefix(self) -> str:
+        trial_name = getattr(self.config, "trial_name", "unknown-trial")
+        return f"[trial={trial_name}]"
+
+    def _log_multiround_info(self, message: str, *args: Any) -> None:
+        prefixed_message = f"{self._multiround_trial_prefix()} {message}"
+        if self._is_plain_quiet_progress_enabled():
+            self.logger.debug(prefixed_message, *args)
+        else:
+            self.logger.info(prefixed_message, *args)
+
+    def _log_multiround_warning(self, message: str, *args: Any) -> None:
+        self.logger.warning(f"{self._multiround_trial_prefix()} {message}", *args)
+
+    def _build_resume_lineage_metadata(
+        self,
+        *,
+        source_trial_dir: Path,
+        start_round: int,
+    ) -> dict[str, Any]:
+        completed_round = start_round - 1
+        config = getattr(self, "config", None)
+        verifier_config = getattr(config, "verifier", None)
+        return {
+            "resume_source_trial": source_trial_dir.name,
+            "resume_source_dir": str(source_trial_dir),
+            "resume_completed_round": completed_round,
+            "resume_into_round": start_round,
+            "resume_state_snapshot_id": getattr(
+                verifier_config, "multiround_resume_state_snapshot_id", None
+            ),
+            "resume_state_image": getattr(
+                verifier_config, "multiround_resume_state_image", None
+            ),
+        }
+
+    def _resolve_resume_snapshot_metadata_path(
+        self, resume_source: Path
+    ) -> Path | None:
+        source_paths = TrialPaths(trial_dir=resume_source)
+        start_round = self.config.verifier.multiround_start_round or 1
+        completed_round = start_round - 1
+
+        if completed_round >= 1:
+            round_snapshot_path = source_paths.round_state_snapshot_path(completed_round)
+            if round_snapshot_path.exists():
+                return round_snapshot_path
+
+            latest_snapshot_path = source_paths.state_snapshot_path
+            if latest_snapshot_path.exists():
+                try:
+                    latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
+                except Exception:
+                    latest_snapshot_payload = {}
+
+                latest_round = latest_snapshot_payload.get("round")
+                if latest_round not in (None, completed_round):
+                    self.logger.warning(
+                        "Requested resume source %s at round %s, but top-level latest "
+                        "snapshot %s points to round %s; refusing fallback to avoid "
+                        "restoring the wrong state",
+                        resume_source,
+                        completed_round,
+                        latest_snapshot_path,
+                        latest_round,
+                    )
+                    return None
+
+                self.logger.warning(
+                    "Round-specific snapshot metadata missing for resume source %s "
+                    "at round %s; falling back to latest snapshot metadata %s",
+                    resume_source,
+                    completed_round,
+                    latest_snapshot_path,
+                )
+                return latest_snapshot_path
+            return None
+
+        latest_snapshot_path = source_paths.state_snapshot_path
+        if latest_snapshot_path.exists():
+            return latest_snapshot_path
+        return None
+
+    def _resolve_resume_source_latest_round(self, source_trial_dir: Path) -> int | None:
+        source_paths = TrialPaths(trial_dir=source_trial_dir)
+        latest_snapshot_path = source_paths.state_snapshot_path
+        if latest_snapshot_path.exists():
+            try:
+                latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
+            except Exception:
+                latest_snapshot_payload = {}
+
+            latest_round = latest_snapshot_payload.get("round")
+            if isinstance(latest_round, int):
+                return latest_round
+
+        round_results_path = source_paths.verifier_dir / "multiround_results.json"
+        if not round_results_path.exists():
+            return None
+
+        try:
+            round_results = json.loads(round_results_path.read_text())
+        except Exception:
+            return None
+
+        rounds = [
+            round_num
+            for item in round_results
+            if isinstance(item, dict)
+            for round_num in [item.get("round")]
+            if isinstance(round_num, int)
+        ]
+        return max(rounds) if rounds else None
+
+    def _resolve_resume_state(self) -> tuple[str | None, str | None, str | None]:
+        """Resolve resume snapshot references from config or resume source trial dir."""
+        image_ref = self.config.verifier.multiround_resume_state_image
+        archive_path = self.config.verifier.multiround_resume_state_archive
+        snapshot_id = self.config.verifier.multiround_resume_state_snapshot_id
+
+        resume_source = self.config.verifier.multiround_resume_source
+        if resume_source is None:
+            return image_ref, archive_path, snapshot_id
+
+        snapshot_meta_path = self._resolve_resume_snapshot_metadata_path(
+            Path(resume_source)
+        )
+        if snapshot_meta_path is None:
+            if not image_ref:
+                raise RuntimeError(
+                    "No matching resume snapshot metadata was found for resume source: "
+                    f"{resume_source}"
+                )
+            return image_ref, archive_path, snapshot_id
+
+        try:
+            snapshot_meta = json.loads(snapshot_meta_path.read_text())
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to read resume snapshot metadata from %s: %s",
+                snapshot_meta_path,
+                exc,
+            )
+            return image_ref, archive_path, snapshot_id
+
+        image_ref = image_ref or snapshot_meta.get("image_tag") or snapshot_meta.get(
+            "image_ref"
+        )
+        archive_path = archive_path or snapshot_meta.get("archive_path")
+        snapshot_id = snapshot_id or snapshot_meta.get("snapshot_id")
+
+        if archive_path:
+            archive_candidate = Path(archive_path).expanduser()
+            if archive_candidate.is_absolute():
+                archive_path = str(archive_candidate)
+            elif archive_candidate.exists():
+                archive_path = str(archive_candidate.resolve())
+            else:
+                metadata_relative_candidate = (
+                    snapshot_meta_path.parent / archive_candidate
+                )
+                if metadata_relative_candidate.exists():
+                    archive_path = str(metadata_relative_candidate.resolve())
+                else:
+                    source_relative_candidate = Path(resume_source) / archive_candidate
+                    if source_relative_candidate.exists():
+                        archive_path = str(source_relative_candidate.resolve())
+
+        if not image_ref:
+            raise RuntimeError(
+                "No resume snapshot image metadata was found for resume source: "
+                f"{resume_source}"
+            )
+
+        return image_ref, archive_path, snapshot_id
+
+    def _requires_snapshot_capability(self) -> bool:
+        if not self.task.is_multiround:
+            return False
+        if self.config.verifier.multiround_resume_source is not None:
+            return True
+        if self._resume_state_image_ref is not None:
+            return True
+        return self.config.verifier.multiround_state_cache_policy != "off"
 
     def _resolve_timeout_sec(
         self,
@@ -433,6 +698,22 @@ class Trial(ABC):
             agent_info=self.agent.to_agent_info(),
             source=self.config.task.source,
         )
+        if self._resume_state_image_ref:
+            self._result.environment_state = EnvironmentStateInfo(
+                image_ref=self._resume_state_image_ref,
+                image_archive=self._resume_state_archive_path,
+                parent_snapshot_id=self._resume_state_snapshot_id,
+                source=self.config.verifier.multiround_resume_source,
+            )
+
+        if (
+            self._requires_snapshot_capability()
+            and not self._environment_supports_state_snapshots
+        ):
+            raise RuntimeError(
+                "Multi-round state snapshots are enabled but the selected environment "
+                "does not implement environment state snapshots"
+            )
 
     def _init_logger(self) -> None:
         self.logger = global_logger.getChild(f"{__name__}.{self.config.trial_name}")
@@ -479,6 +760,8 @@ class Trial(ABC):
             task_env_config=self.task.config.environment,
             logger=self.logger,
             mounts=self._agent_env_mounts,
+            resume_state_image_ref=self._resume_state_image_ref,
+            resume_state_archive_path=self._resume_state_archive_path,
         )
         if self.agent_environment.capabilities.mounted:
             self.paths.chmod_dir()

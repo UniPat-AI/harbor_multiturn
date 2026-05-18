@@ -136,6 +136,30 @@ async def test_send_non_blocking_keys_small_payload_single_exec(tmux_session):
     assert _extract_send_keys_payload(command) == ["echo hi"]
 
 
+async def test_send_non_blocking_keys_empty_string_is_noop(tmux_session):
+    tmux_session.environment.exec = AsyncMock(return_value=ExecResult(return_code=0))
+
+    await tmux_session._send_non_blocking_keys(keys=[""], min_timeout_sec=0.0)
+
+    assert tmux_session.environment.exec.await_count == 0
+
+
+async def test_send_non_blocking_keys_retries_empty_stderr_when_session_alive(
+    tmux_session,
+):
+    tmux_session.environment.exec = AsyncMock(
+        side_effect=[
+            ExecResult(return_code=1, stderr=None),
+            ExecResult(return_code=0),
+            ExecResult(return_code=0),
+        ]
+    )
+
+    await tmux_session._send_non_blocking_keys(keys=["echo hi"], min_timeout_sec=0.0)
+
+    assert tmux_session.environment.exec.await_count == 3
+
+
 async def test_send_non_blocking_keys_raises_on_failed_chunk(tmux_session):
     long_key = "x" * (tmux_session._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH * 2)
     commands = tmux_session._tmux_send_keys([long_key])

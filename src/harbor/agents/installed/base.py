@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import os
 from abc import ABC, abstractmethod
@@ -6,7 +7,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from harbor.agents.base import BaseAgent
-from harbor.environments.base import BaseEnvironment
+from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.utils.env import parse_bool_env_value
 from harbor.utils.templating import render_prompt_template
 
@@ -14,7 +15,9 @@ from harbor.utils.templating import render_prompt_template
 class NonZeroAgentExitCodeError(RuntimeError):
     """Raised when the agent process exits with a non-zero exit code."""
 
-    pass
+    def __init__(self, message: str, *, result: ExecResult | None = None):
+        super().__init__(message)
+        self.result = result
 
 
 _F = Any  # Use Any to keep the decorator signature-transparent to type checkers
@@ -133,6 +136,23 @@ def _coerce_value(
             raise ValueError(f"Unknown type '{type}' for kwarg '{kwarg_name}'")
 
 
+TRANSIENT_SETUP_RETURN_CODES = frozenset({7, 28, 35, 52, 56})
+TRANSIENT_SETUP_ERROR_FRAGMENTS = (
+    "unexpected eof while reading",
+    "connection reset",
+    "connection refused",
+    "could not resolve host",
+    "temporary failure",
+    "temporary failure resolving",
+    "network is unreachable",
+    "operation timed out",
+    "read timeout",
+    "tls handshake timeout",
+    "econnreset",
+    "eai_again",
+)
+
+
 class BaseInstalledAgent(BaseAgent, ABC):
     """
     An interface for agents that are installed and run in the environment.
@@ -168,6 +188,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
             Path(prompt_template_path) if prompt_template_path else None
         )
         self._version = version
+        self._last_exec_result: ExecResult | None = None
 
     def _resolve_raw_value(
         self,
@@ -265,6 +286,51 @@ class BaseInstalledAgent(BaseAgent, ABC):
         Override in subclasses if the command output needs parsing."""
         return stdout.strip()
 
+    def _setup_max_attempts(self) -> int:
+        """Maximum number of install attempts for transient failures."""
+        return 3
+
+    def _setup_retry_delay_sec(self, attempt_number: int) -> float:
+        """Exponential backoff between install retries."""
+        return float(min(2 ** (attempt_number - 1), 5))
+
+    def _is_transient_setup_failure(self, result: ExecResult) -> bool:
+        if result.return_code == 0:
+            return False
+
+        if result.return_code in TRANSIENT_SETUP_RETURN_CODES:
+            return True
+
+        combined_output = "\n".join(
+            part for part in (result.stdout, result.stderr) if part
+        ).lower()
+        return any(
+            fragment in combined_output for fragment in TRANSIENT_SETUP_ERROR_FRAGMENTS
+        )
+
+    def _write_setup_logs(
+        self,
+        setup_dir: Path,
+        result: ExecResult,
+        attempt_number: int,
+    ) -> None:
+        attempt_dir = setup_dir / f"attempt-{attempt_number}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        for output_dir in (setup_dir, attempt_dir):
+            (output_dir / "return-code.txt").write_text(str(result.return_code))
+            self._write_optional_log(output_dir / "stdout.txt", result.stdout)
+            self._write_optional_log(output_dir / "stderr.txt", result.stderr)
+
+    @staticmethod
+    def _write_optional_log(path: Path, content: str | None) -> None:
+        if content:
+            path.write_text(content)
+            return
+
+        if path.exists():
+            path.unlink()
+
     def _truncate_output(self, text: str | None, max_len: int = 1000) -> str:
         if not text:
             return "None"
@@ -305,6 +371,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
             cwd=cwd,
             timeout_sec=timeout_sec,
         )
+        self._last_exec_result = result
         if result.return_code != 0:
             self.logger.debug(
                 "Command failed",
@@ -317,7 +384,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
             raise NonZeroAgentExitCodeError(
                 f"Command failed (exit {result.return_code}): {command}\n"
                 f"stdout: {self._truncate_output(result.stdout)}\n"
-                f"stderr: {self._truncate_output(result.stderr)}"
+                f"stderr: {self._truncate_output(result.stderr)}",
+                result=result,
             )
 
         self.logger.debug(
@@ -376,12 +444,52 @@ class BaseInstalledAgent(BaseAgent, ABC):
         setup_dir = self.logs_dir / "setup"
         setup_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            await self.install(environment)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"Agent install failed: {exc}") from exc
+        max_attempts = max(1, self._setup_max_attempts())
+        last_result: ExecResult | None = None
+        attempt_number = 0
+
+        for attempt_number in range(1, max_attempts + 1):
+            self._last_exec_result = None
+            try:
+                await self.install(environment)
+            except NonZeroAgentExitCodeError as exc:
+                if exc.result is None:
+                    raise
+                last_result = exc.result
+                self._write_setup_logs(setup_dir, last_result, attempt_number)
+
+                if (
+                    attempt_number == max_attempts
+                    or not self._is_transient_setup_failure(last_result)
+                ):
+                    raise RuntimeError(
+                        f"Agent setup failed with exit code {last_result.return_code} "
+                        f"after {attempt_number} attempt(s). See logs in {setup_dir}"
+                    ) from exc
+
+                delay_sec = self._setup_retry_delay_sec(attempt_number)
+                self.logger.warning(
+                    "Agent setup failed transiently with exit code %d on attempt %d/%d; retrying in %.1fs",
+                    last_result.return_code,
+                    attempt_number,
+                    max_attempts,
+                    delay_sec,
+                )
+                if delay_sec > 0:
+                    await asyncio.sleep(delay_sec)
+                continue
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"Agent install failed: {exc}") from exc
+
+            last_result = self._last_exec_result or ExecResult(
+                return_code=0, stdout="", stderr=""
+            )
+            self._write_setup_logs(setup_dir, last_result, attempt_number)
+            break
+        else:
+            raise RuntimeError("Agent setup produced no execution result.")
 
         if self._version is None:
             version_cmd = self.get_version_command()

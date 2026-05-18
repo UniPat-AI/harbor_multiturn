@@ -63,6 +63,59 @@ class AgentFactory:
     }
 
     @classmethod
+    def get_agent_class_from_name(cls, name: AgentName) -> type[BaseAgent]:
+        if name not in cls._AGENT_MAP:
+            raise ValueError(
+                f"Unknown agent type: {name}. This could be because the agent is not "
+                "registered in the AgentFactory or because the agent name is invalid."
+            )
+        return cls._AGENT_MAP[name]
+
+    @classmethod
+    def get_agent_class_from_import_path(cls, import_path: str) -> type[BaseAgent]:
+        if ":" not in import_path:
+            raise ValueError("Import path must be in format 'module.path:ClassName'")
+
+        module_path, class_name = import_path.split(":", 1)
+
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            raise ValueError(f"Failed to import module '{module_path}': {e}") from e
+
+        try:
+            Agent = getattr(module, class_name)
+        except AttributeError as e:
+            raise ValueError(
+                f"Module '{module_path}' has no class '{class_name}'"
+            ) from e
+
+        return Agent
+
+    @classmethod
+    def get_agent_class_from_config(cls, config: AgentConfig) -> type[BaseAgent]:
+        if config.name is not None and config.name in AgentName.values():
+            return cls.get_agent_class_from_name(AgentName(config.name))
+        if config.import_path is not None:
+            return cls.get_agent_class_from_import_path(config.import_path)
+        if config.name is not None:
+            raise ValueError(
+                f"Agent name {config.name} is not valid. Valid agent names: {AgentName.values()}"
+            )
+        raise ValueError(
+            "At least one of agent_name or agent_import_path must be set. "
+            + f"Valid agent names: {AgentName.values()}"
+        )
+
+    @classmethod
+    def supports_multiround_from_config(cls, config: AgentConfig) -> bool:
+        return cls.get_agent_class_from_config(config).supports_multiround()
+
+    @classmethod
+    def multiround_supported_agent_names(cls) -> list[str]:
+        return sorted(agent.name() for agent in cls._AGENTS if agent.supports_multiround())
+
+    @classmethod
     def create_agent_from_name(
         cls,
         name: AgentName,
@@ -82,13 +135,7 @@ class AgentFactory:
         Raises:
             ValueError: If the agent name is invalid.
         """
-        if name not in cls._AGENT_MAP:
-            raise ValueError(
-                f"Unknown agent type: {name}. This could be because the agent is not "
-                "registered in the AgentFactory or because the agent name is invalid."
-            )
-
-        agent_class = cls._AGENT_MAP[name]
+        agent_class = cls.get_agent_class_from_name(name)
 
         return agent_class(logs_dir=logs_dir, model_name=model_name, **kwargs)
 
@@ -113,22 +160,7 @@ class AgentFactory:
         Raises:
             ValueError: If the import path is invalid.
         """
-        if ":" not in import_path:
-            raise ValueError("Import path must be in format 'module.path:ClassName'")
-
-        module_path, class_name = import_path.split(":", 1)
-
-        try:
-            module = importlib.import_module(module_path)
-        except ImportError as e:
-            raise ValueError(f"Failed to import module '{module_path}': {e}") from e
-
-        try:
-            Agent = getattr(module, class_name)
-        except AttributeError as e:
-            raise ValueError(
-                f"Module '{module_path}' has no class '{class_name}'"
-            ) from e
+        Agent = cls.get_agent_class_from_import_path(import_path)
 
         return Agent(logs_dir=logs_dir, model_name=model_name, **kwargs)
 
@@ -172,9 +204,7 @@ class AgentFactory:
             )
         elif config.name is not None:
             raise ValueError(
-                f"Agent name {config.name} is not valid. Valid agent names: {
-                    AgentName.values()
-                }"
+                f"Agent name {config.name} is not valid. Valid agent names: {AgentName.values()}"
             )
         else:
             raise ValueError(

@@ -153,6 +153,33 @@ class VerifierConfig(BaseModel):
     max_timeout_sec: float | None = None
     env: dict[str, str] = Field(default_factory=dict)
     disable: bool = False
+    multiround_continue_successes_per_round: int = Field(default=1, ge=1)
+    multiround_state_cache_policy: str = "success"
+    multiround_resume_preflight_policy: str = "strict"
+    multiround_max_round: int | None = None
+    multiround_start_round: int | None = None
+    multiround_aggregate_start_round: int | None = Field(default=None, ge=1)
+    multiround_aggregate_end_round: int | None = Field(default=None, ge=1)
+    multiround_resume_source: str | None = None
+    multiround_resume_trial_name: str | None = None
+    multiround_resume_state_image: str | None = None
+    multiround_resume_state_archive: str | None = None
+    multiround_resume_state_snapshot_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_multiround_policies(self):
+        allowed = {"off", "success", "all"}
+        if self.multiround_state_cache_policy not in allowed:
+            raise ValueError(
+                "multiround_state_cache_policy must be one of: off, success, all"
+            )
+        allowed_preflight = {"off", "snapshot", "strict"}
+        if self.multiround_resume_preflight_policy not in allowed_preflight:
+            raise ValueError(
+                "multiround_resume_preflight_policy must be one of: "
+                "off, snapshot, strict"
+            )
+        return self
 
     @field_serializer("env")
     @classmethod
@@ -248,7 +275,10 @@ class TrialConfig(BaseModel):
     @model_validator(mode="after")
     def set_default_trial_name(self):
         if not self.trial_name:
-            self.trial_name = self.generate_trial_name()
+            if self.verifier.multiround_resume_trial_name:
+                self.trial_name = self.verifier.multiround_resume_trial_name
+            else:
+                self.trial_name = self.generate_trial_name()
         return self
 
     def generate_trial_name(self):

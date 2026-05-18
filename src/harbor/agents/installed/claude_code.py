@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 from harbor.models.trial.paths import EnvironmentPaths
+from harbor.utils.templating import render_prompt_template
 
 
 class ClaudeCode(BaseInstalledAgent):
@@ -109,6 +111,7 @@ class ClaudeCode(BaseInstalledAgent):
         **kwargs,
     ):
         self.memory_dir = memory_dir
+        self._round_starts: list[tuple[int, str]] = []
         super().__init__(logs_dir, *args, **kwargs)
 
     def get_version_command(self) -> str | None:
@@ -314,6 +317,20 @@ class ClaudeCode(BaseInstalledAgent):
             return step
 
         raise ValueError(f"Unsupported event kind '{kind}'")
+
+    def _get_round_for_timestamp(self, ts: str | None) -> int | None:
+        """Return the round number for a given ISO timestamp, or None if not multi-round."""
+        if not self._round_starts or ts is None:
+            return None
+        # _round_starts is sorted by invocation order (ascending time).
+        # Find the last round whose start_time <= ts.
+        result = None
+        for round_num, start_ts in self._round_starts:
+            if start_ts <= ts:
+                result = round_num
+            else:
+                break
+        return result
 
     @staticmethod
     def _stringify(value: Any) -> str:
@@ -831,6 +848,14 @@ class ClaudeCode(BaseInstalledAgent):
             if step.source == "agent" and not step.model_name and default_model_name:
                 step.model_name = default_model_name
 
+            # Inject round number for multi-round tasks
+            round_num = self._get_round_for_timestamp(step.timestamp)
+            if round_num is not None:
+                if step.extra is None:
+                    step.extra = {"round": round_num}
+                else:
+                    step.extra["round"] = round_num
+
             steps.append(step)
 
         if not steps:
@@ -1012,12 +1037,8 @@ class ClaudeCode(BaseInstalledAgent):
             return True
         return False
 
-    @with_prompt_template
-    async def run(
-        self, instruction: str, environment: BaseEnvironment, context: AgentContext
-    ) -> None:
-        escaped_instruction = shlex.quote(instruction)
-
+    def _build_env(self) -> dict[str, str]:
+        """Build environment variables dict for Claude Code execution."""
         use_bedrock = self._is_bedrock_mode()
 
         env = {
@@ -1112,6 +1133,10 @@ class ClaudeCode(BaseInstalledAgent):
 
         env["CLAUDE_CONFIG_DIR"] = (EnvironmentPaths.agent_dir / "sessions").as_posix()
 
+        return env
+
+    def _build_setup_command(self) -> str:
+        """Build the setup shell command (mkdir, skills, MCP registration)."""
         setup_command = (
             "mkdir -p $CLAUDE_CONFIG_DIR/debug $CLAUDE_CONFIG_DIR/projects/-app "
             "$CLAUDE_CONFIG_DIR/shell-snapshots $CLAUDE_CONFIG_DIR/statsig "
@@ -1133,23 +1158,104 @@ class ClaudeCode(BaseInstalledAgent):
         if mcp_command:
             setup_command += f" && {mcp_command}"
 
-        cli_flags = self.build_cli_flags()
-        extra_flags = (cli_flags + " ") if cli_flags else ""
+        return setup_command
 
+    def _build_cli_flags_prefix(self) -> str:
+        cli_flags = self.build_cli_flags()
+        return f"{cli_flags} " if cli_flags else ""
+
+    def _build_claude_print_command(
+        self,
+        *,
+        instruction: str,
+        log_file: str,
+        continue_session: bool = False,
+    ) -> str:
+        continue_flag = "--continue " if continue_session else ""
+        return (
+            'export PATH="$HOME/.local/bin:$PATH"; '
+            f"claude {continue_flag}--verbose --output-format=stream-json "
+            f"--permission-mode=bypassPermissions "
+            f"{self._build_cli_flags_prefix()}"
+            f"--print -- {shlex.quote(instruction)} 2>&1 </dev/null | "
+            f"stdbuf -oL tee /logs/agent/{log_file}"
+        )
+
+    @with_prompt_template
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        env = self._build_env()
         await self.exec_as_agent(
             environment,
-            command=setup_command,
+            command=self._build_setup_command(),
             env=env,
         )
         await self.exec_as_agent(
             environment,
-            command=(
-                'export PATH="$HOME/.local/bin:$PATH"; '
-                f"claude --verbose --output-format=stream-json "
-                f"--permission-mode=bypassPermissions "
-                f"{extra_flags}"
-                f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
-                f"/logs/agent/claude-code.txt"
+            command=self._build_claude_print_command(
+                instruction=instruction,
+                log_file="claude-code.txt",
             ),
             env=env,
         )
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Run Claude Code for a specific round with session continuity.
+
+        Round 1: normal setup + ``claude --print``
+        Round 2+: ``claude --continue --print`` (reuses previous session)
+
+        Does NOT call ``populate_context_post_run()`` — the Trial calls it
+        once after all rounds complete, reading every JSONL file to build
+        the full trajectory.
+        """
+        self._round_starts.append(
+            (round_num, datetime.now(timezone.utc).isoformat())
+        )
+        rendered_instruction = (
+            render_prompt_template(self._prompt_template_path, instruction)
+            if self._prompt_template_path
+            else instruction
+        )
+
+        env = self._build_env()
+        commands: list[str] = []
+
+        if round_num == 1:
+            commands.extend(
+                [
+                    self._build_setup_command(),
+                    self._build_claude_print_command(
+                        instruction=rendered_instruction,
+                        log_file="claude-code.txt",
+                    ),
+                ]
+            )
+        else:
+            commands.append(
+                self._build_claude_print_command(
+                    instruction=rendered_instruction,
+                    log_file=f"claude-code-round-{round_num}.txt",
+                    continue_session=True,
+                )
+            )
+
+        for i, command in enumerate(commands):
+            command_dir = self.logs_dir / f"round-{round_num}-command-{i}"
+            command_dir.mkdir(parents=True, exist_ok=True)
+            (command_dir / "command.txt").write_text(command)
+            result = await self.exec_as_agent(environment, command=command, env=env)
+            (command_dir / "return-code.txt").write_text(str(result.return_code))
+
+            if result.stdout:
+                (command_dir / "stdout.txt").write_text(result.stdout)
+
+            if result.stderr:
+                (command_dir / "stderr.txt").write_text(result.stderr)

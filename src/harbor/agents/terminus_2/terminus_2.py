@@ -1,4 +1,5 @@
 import copy
+import json
 import shlex
 import time
 import uuid
@@ -296,8 +297,12 @@ class Terminus2(BaseAgent):
         self._user_provided_session_id: str | None = session_id
         self._session_id = session_id if session_id else str(uuid.uuid4())
         self._trajectory_steps: list[Step] = []
+        self._current_round: int | None = None  # Set during multi-round execution
         self._record_terminal_session = record_terminal_session
         self._llm_call_kwargs = dict(llm_call_kwargs) if llm_call_kwargs else {}
+        self._pending_resume_cwd: str | None = None
+        self._pending_resume_previous_buffer: str | None = None
+        self._has_pending_resume_previous_buffer = False
 
         self._summarization_count: int = (
             0  # Track number of summarization subagents created
@@ -371,6 +376,192 @@ class Terminus2(BaseAgent):
             user=environment.default_user,
         )
         await self._session.start()
+
+    async def capture_resume_state(self, snapshot_path: Path, round_num: int) -> None:
+        if self._chat is None:
+            raise RuntimeError("Cannot capture Terminus-2 resume state without chat history")
+
+        current_path = None
+        previous_buffer = None
+        if self._session is not None:
+            current_path = await self._session.get_current_path()
+            previous_buffer = self._session.get_previous_buffer()
+
+        payload = {
+            "round": round_num,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "chat_messages": self._chat.messages,
+            "chat_last_response_id": self._chat._last_response_id,
+            "chat_usage": {
+                "prompt_tokens": self._chat.total_input_tokens,
+                "completion_tokens": self._chat.total_output_tokens,
+                "cache_tokens": self._chat.total_cache_tokens,
+                "cost_usd": self._chat.total_cost,
+            },
+            "chat_rollout_details": self._chat.rollout_details,
+            "trajectory_steps": [
+                step.model_dump(mode="json", exclude_none=True)
+                for step in self._trajectory_steps
+            ],
+            "subagent_metrics": {
+                "total_prompt_tokens": self._subagent_metrics.total_prompt_tokens,
+                "total_completion_tokens": self._subagent_metrics.total_completion_tokens,
+                "total_cached_tokens": self._subagent_metrics.total_cached_tokens,
+                "total_cost_usd": self._subagent_metrics.total_cost_usd,
+            },
+            "subagent_rollout_details": self._subagent_rollout_details,
+            "summarization_count": self._summarization_count,
+            "pending_subagent_refs": [
+                ref.model_dump(mode="json", exclude_none=True)
+                for ref in self._pending_subagent_refs
+            ]
+            if self._pending_subagent_refs
+            else None,
+            "pending_handoff_prompt": self._pending_handoff_prompt,
+            "pending_completion": self._pending_completion,
+            "api_request_times_msec": self._api_request_times,
+            "n_episodes": self._n_episodes,
+            "shell_current_path": current_path,
+            "tmux_previous_buffer": previous_buffer,
+        }
+
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+        # A same-trial Docker state snapshot may stop and restart the container,
+        # which kills the live tmux server. Keep the runtime state pending on the
+        # current agent too, not only in the on-disk snapshot used by later
+        # resume jobs.
+        self._pending_resume_cwd = current_path
+        self._has_pending_resume_previous_buffer = True
+        self._pending_resume_previous_buffer = previous_buffer
+
+    def restore_resume_state(self, snapshot_path: Path) -> None:
+        payload = json.loads(snapshot_path.read_text())
+
+        restored_chat = Chat(
+            self._llm,
+            interleaved_thinking=self._interleaved_thinking,
+        )
+        restored_chat.messages.extend(payload.get("chat_messages") or [])
+
+        chat_usage = payload.get("chat_usage") or {}
+        restored_chat._cumulative_input_tokens = int(chat_usage.get("prompt_tokens", 0))
+        restored_chat._cumulative_output_tokens = int(
+            chat_usage.get("completion_tokens", 0)
+        )
+        restored_chat._cumulative_cache_tokens = int(chat_usage.get("cache_tokens", 0))
+        restored_chat._cumulative_cost = float(chat_usage.get("cost_usd", 0.0) or 0.0)
+
+        main_rollout_details = payload.get("chat_rollout_details") or []
+        if main_rollout_details:
+            main_rollout = main_rollout_details[0]
+            restored_chat._prompt_token_ids_list = list(
+                main_rollout.get("prompt_token_ids") or []
+            )
+            restored_chat._completion_token_ids_list = list(
+                main_rollout.get("completion_token_ids") or []
+            )
+            restored_chat._logprobs_list = list(main_rollout.get("logprobs") or [])
+
+        if "chat_last_response_id" in payload:
+            restored_chat._last_response_id = payload.get("chat_last_response_id")
+        else:
+            restored_chat.reset_response_chain()
+        self._chat = restored_chat
+
+        self._trajectory_steps = [
+            Step.model_validate(step)
+            for step in (payload.get("trajectory_steps") or [])
+        ]
+        self._subagent_metrics = SubagentMetrics(
+            **(payload.get("subagent_metrics") or {})
+        )
+        self._subagent_rollout_details = list(
+            payload.get("subagent_rollout_details") or []
+        )
+        self._summarization_count = int(payload.get("summarization_count", 0) or 0)
+
+        pending_subagent_refs = payload.get("pending_subagent_refs") or []
+        self._pending_subagent_refs = (
+            [
+                SubagentTrajectoryRef.model_validate(ref)
+                for ref in pending_subagent_refs
+            ]
+            if pending_subagent_refs
+            else None
+        )
+        self._pending_handoff_prompt = payload.get("pending_handoff_prompt")
+        self._pending_completion = bool(payload.get("pending_completion", False))
+        self._api_request_times = list(payload.get("api_request_times_msec") or [])
+        self._n_episodes = int(payload.get("n_episodes", 0) or 0)
+        self._pending_resume_cwd = payload.get("shell_current_path")
+        self._has_pending_resume_previous_buffer = "tmux_previous_buffer" in payload
+        self._pending_resume_previous_buffer = payload.get("tmux_previous_buffer")
+
+    async def _apply_pending_resume_session_state(self) -> None:
+        if self._session is None:
+            return
+
+        try:
+            if self._pending_resume_cwd is not None:
+                await self._session.restore_working_directory(self._pending_resume_cwd)
+            if self._has_pending_resume_previous_buffer:
+                self._session.restore_previous_buffer(
+                    self._pending_resume_previous_buffer
+                )
+        finally:
+            self._pending_resume_cwd = None
+            self._pending_resume_previous_buffer = None
+            self._has_pending_resume_previous_buffer = False
+
+    async def _ensure_session_alive(self) -> None:
+        if self._session is None:
+            raise RuntimeError("Session is not set")
+
+        is_session_alive = getattr(self._session, "is_session_alive", None)
+        if is_session_alive is None:
+            return
+
+        if await is_session_alive():
+            return
+
+        start = getattr(self._session, "start", None)
+        if start is None:
+            raise RuntimeError("Terminus-2 tmux session ended and cannot be restarted")
+
+        self.logger.debug("Terminus-2 tmux session ended; restarting session")
+        await start()
+
+    async def _send_keys_with_session_recovery(
+        self,
+        session: TmuxSession,
+        command: Command,
+    ) -> None:
+        current_path = None
+        try:
+            current_path = await session.get_current_path()
+        except Exception:
+            current_path = None
+
+        try:
+            await session.send_keys(
+                command.keystrokes,
+                block=False,
+                min_timeout_sec=command.duration_sec,
+            )
+            return
+        except RuntimeError:
+            self._pending_resume_cwd = current_path
+            self._has_pending_resume_previous_buffer = True
+            self._pending_resume_previous_buffer = session.get_previous_buffer()
+            await self._ensure_session_alive()
+            await self._apply_pending_resume_session_state()
+            await session.send_keys(
+                command.keystrokes,
+                block=False,
+                min_timeout_sec=command.duration_sec,
+            )
 
     def _get_parser(self):
         """Return the appropriate parser instance for this format."""
@@ -521,11 +712,38 @@ class Terminus2(BaseAgent):
             episode_logging_dir / "response.txt",
         )
 
+    def _step_extra(self, extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Build step extra dict, injecting round number when in multi-round mode."""
+        if self._current_round is None:
+            return extra
+        if extra is None:
+            return {"round": self._current_round}
+        return {**extra, "round": self._current_round}
+
     def _count_total_tokens(self, chat: Chat) -> int:
         """Count total tokens across all messages in the chat."""
         from litellm.utils import token_counter
 
         return token_counter(model=self._model_name, messages=chat.messages)
+
+    def _build_continuation_prompt(
+        self,
+        *,
+        instruction: str,
+        terminal_state: str,
+    ) -> str:
+        """Build the first prompt for continuing execution.
+
+        Reuse Terminus-2's normal continuation style instead of replaying the
+        full fresh-start template. The model already has the formatting rules in
+        its message history; here we only need to provide the new instruction
+        and the current terminal output/screen.
+        """
+        limited_terminal_state = self._limit_output_length(terminal_state)
+        stripped_instruction = instruction.strip()
+        if not stripped_instruction:
+            return limited_terminal_state
+        return f"{stripped_instruction}\n\n{limited_terminal_state}"
 
     def _limit_output_length(self, output: str, max_bytes: int = 10000) -> str:
         """
@@ -1234,11 +1452,7 @@ so ask everything you need to know."""
         """
         for command in commands:
             try:
-                await session.send_keys(
-                    command.keystrokes,
-                    block=False,
-                    min_timeout_sec=command.duration_sec,
-                )
+                await self._send_keys_with_session_recovery(session, command)
             except TimeoutError:
                 return True, self._timeout_template.format(
                     timeout_sec=command.duration_sec,
@@ -1274,7 +1488,10 @@ so ask everything you need to know."""
         # Step 1: system message (includes task instruction)
         # Steps 2+: agent episodes (starting from episode 0)
 
-        for episode in range(self._max_episodes):
+        # Continue episode numbering from restored resume state when available so
+        # per-trial episode logs reflect the full conversational lineage.
+        episode_start = self._n_episodes
+        for episode in range(episode_start, episode_start + self._max_episodes):
             self._n_episodes = episode + 1
             if not await self._session.is_session_alive():
                 self.logger.debug("Session has ended, breaking out of agent loop")
@@ -1329,6 +1546,7 @@ so ask everything you need to know."""
                                 )
                             ]
                         ),
+                        extra=self._step_extra(),
                     )
                 )
                 self._pending_subagent_refs = None
@@ -1349,6 +1567,7 @@ so ask everything you need to know."""
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             source="user",
                             message=self._pending_handoff_prompt,
+                            extra=self._step_extra(),
                         )
                     )
                 self._pending_handoff_prompt = None
@@ -1415,6 +1634,7 @@ so ask everything you need to know."""
                             completion_token_ids=llm_response.completion_token_ids,
                             logprobs=llm_response.logprobs,
                         ),
+                        extra=self._step_extra(),
                     )
                 )
                 continue
@@ -1543,6 +1763,7 @@ so ask everything you need to know."""
                         completion_token_ids=llm_response.completion_token_ids,
                         logprobs=llm_response.logprobs,
                     ),
+                    extra=self._step_extra(),
                 )
             )
 
@@ -1621,6 +1842,7 @@ so ask everything you need to know."""
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 source="user",
                 message=initial_prompt,
+                extra=self._step_extra(),
             )
         )
 
@@ -1639,6 +1861,95 @@ so ask everything you need to know."""
             )
 
             # Include subagent metrics in context totals
+            context.n_input_tokens = (
+                self._chat.total_input_tokens
+                + self._subagent_metrics.total_prompt_tokens
+            )
+            context.n_output_tokens = (
+                self._chat.total_output_tokens
+                + self._subagent_metrics.total_completion_tokens
+            )
+            context.n_cache_tokens = (
+                self._chat.total_cache_tokens
+                + self._subagent_metrics.total_cached_tokens
+            )
+            total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd
+            context.cost_usd = total_cost if total_cost > 0 else None
+            context.metadata = {
+                "n_episodes": self._n_episodes,
+                "api_request_times_msec": self._api_request_times,
+                "summarization_count": self._summarization_count,
+            }
+            if self._store_all_messages:
+                context.metadata["all_messages"] = self._chat.messages
+
+            # Dump trajectory to JSON
+            self._dump_trajectory()
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Multi-round support: reuse Chat and tmux session across rounds."""
+        self._current_round = round_num
+        self._context = context
+        if round_num == 1 or self._chat is None:
+            # First round: normal initialization
+            return await self.run(instruction, environment, context)
+
+        # Subsequent rounds: reuse existing Chat (preserves conversation history)
+        # and existing tmux session (preserves /app/ state)
+        if self._session is None:
+            raise RuntimeError("Session is not set")
+
+        await self._ensure_session_alive()
+        await self._apply_pending_resume_session_state()
+
+        # Get current terminal state
+        terminal_state = self._limit_output_length(
+            await self._session.get_incremental_output()
+        )
+
+        # Build the new round's prompt
+        augmented_instruction = instruction
+        skills_section = await self._build_skills_section(environment)
+        if skills_section:
+            augmented_instruction += skills_section
+
+        initial_prompt = self._build_continuation_prompt(
+            instruction=augmented_instruction,
+            terminal_state=terminal_state,
+        )
+
+        # Append new instruction as a user step (continuing step_id sequence)
+        self._trajectory_steps.append(
+            Step(
+                step_id=len(self._trajectory_steps) + 1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=initial_prompt,
+                extra=self._step_extra(),
+            )
+        )
+
+        # Reset completion state for the new round
+        self._pending_completion = False
+
+        try:
+            await self._run_agent_loop(
+                initial_prompt=initial_prompt,
+                chat=self._chat,
+                logging_dir=self.logs_dir,
+                original_instruction=instruction,
+            )
+        finally:
+            # Update context metrics (cumulative across all rounds)
+            context.rollout_details = (
+                self._chat.rollout_details + self._subagent_rollout_details
+            )
             context.n_input_tokens = (
                 self._chat.total_input_tokens
                 + self._subagent_metrics.total_prompt_tokens

@@ -135,3 +135,74 @@ class OracleAgent(BaseAgent):
         finally:
             if self._task.has_steps:
                 self._step_index += 1
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Oracle: upload and run round-specific solution."""
+        if not self._task.is_multiround:
+            return await self.run(instruction, environment, context)
+
+        env_paths = EnvironmentPaths.for_os(environment.os)
+        task_os = self._task.config.environment.os
+        round_solution_dir = self._task.paths.round_solution_dir(round_num)
+        round_solve_path = self._task.paths.discovered_round_solve_path_for(
+            round_num, task_os
+        )
+
+        log_file = f"round_{round_num}_oracle.txt"
+        host_oracle_path = self._trial_paths.agent_dir / log_file
+        container_oracle_log = str(env_paths.agent_dir / log_file)
+
+        if round_solve_path is None:
+            raise FileNotFoundError(
+                "No OS-compatible solution script found for round "
+                f"{round_num}: expected "
+                f"{self._task.paths.round_solve_path_for(round_num, task_os)}"
+            )
+
+        await environment.upload_dir(
+            source_dir=round_solution_dir,
+            target_dir=str(env_paths.solution_dir),
+        )
+
+        container_solve = str(
+            env_paths.solution_dir / round_solve_path.relative_to(round_solution_dir)
+        )
+        command = build_execution_command(
+            container_solve,
+            stdout_path=container_oracle_log,
+            task_os=task_os,
+        )
+
+        if needs_chmod(container_solve):
+            await environment.exec(
+                command=f"chmod +x {quote_shell_arg(container_solve, task_os)}",
+                user="root",
+            )
+
+        env = {"DEBIAN_FRONTEND": "noninteractive", **self._extra_env}
+        if self._task.config.solution.env:
+            env.update(resolve_env_vars(self._task.config.solution.env))
+
+        timeout_sec = int(self._agent_timeout_sec) if self._agent_timeout_sec else None
+        result = await environment.exec(command=command, env=env, timeout_sec=timeout_sec)
+
+        if not environment.capabilities.mounted:
+            try:
+                await environment.download_file(
+                    source_path=container_oracle_log,
+                    target_path=host_oracle_path,
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to download {log_file}: {e}")
+
+        if result.return_code != 0:
+            exit_code_path = (
+                self._trial_paths.agent_dir / f"round_{round_num}_exit-code.txt"
+            )
+            exit_code_path.write_text(str(result.return_code))

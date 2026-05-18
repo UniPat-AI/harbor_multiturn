@@ -323,6 +323,18 @@ def test_lock_uses_pruned_trial_locks_without_job_level_duplicates() -> None:
         "max_timeout_sec": 8.0,
         "env": {"VERIFIER_MODE": "strict"},
         "disable": True,
+        "multiround_continue_successes_per_round": 1,
+        "multiround_state_cache_policy": "success",
+        "multiround_resume_preflight_policy": "strict",
+        "multiround_max_round": None,
+        "multiround_start_round": None,
+        "multiround_aggregate_start_round": None,
+        "multiround_aggregate_end_round": None,
+        "multiround_resume_source": None,
+        "multiround_resume_trial_name": None,
+        "multiround_resume_state_image": None,
+        "multiround_resume_state_archive": None,
+        "multiround_resume_state_snapshot_id": None,
     }
 
 

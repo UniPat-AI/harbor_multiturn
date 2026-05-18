@@ -1,5 +1,7 @@
+import hashlib
 import json
 import logging
+import re
 import shutil
 import signal
 from datetime import datetime
@@ -13,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 from typer import Argument, Option, Typer
 
+from harbor.agents.factory import AgentFactory
 from harbor.cli.notifications import show_registry_hint_if_first_run
 from harbor.cli.utils import parse_env_vars, parse_kwargs, run_async
 from harbor.models.agent.name import AgentName
@@ -27,15 +30,36 @@ from harbor.models.trial.config import (
     AgentConfig,
     EnvironmentConfig,
     TaskConfig,
+    TrialConfig,
 )
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
 jobs_app = Typer(
-    no_args_is_help=True, context_settings={"help_option_names": ["-h", "--help"]}
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    pretty_exceptions_enable=False,
 )
 console = Console()
 logger = logging.getLogger(__name__)
+
+_VOLATILE_TASK_DIR_NAMES = {
+    ".git",
+    ".pytest_cache",
+    "__pycache__",
+    "agent_logs",
+    "eval_runs",
+    "harbor_jobs",
+    "log",
+    "logs",
+}
+_VOLATILE_TASK_FILE_NAMES = {
+    ".env",
+    "conditionally_passed.txt",
+    "creating_jobs_latest.txt",
+    "failed.txt",
+    "passed.txt",
+}
 
 
 def _confirm_host_env_access(
@@ -227,6 +251,24 @@ def _format_group_title(evals_key: str, job_result) -> str:
 
 
 def print_job_results_tables(job_result) -> None:
+    def _round_key_order(key: str) -> tuple[int, str]:
+        match = re.fullmatch(r"round_(\d+)", key)
+        if match:
+            return (int(match.group(1)), key)
+        return (10**9, key)
+
+    def _reward_value_sort_key(value: float | int):
+        try:
+            return (-float(value), str(value))
+        except Exception:
+            return (0.0, str(value))
+
+    def _reward_to_float(value: float | int) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
     for evals_key, dataset_stats in job_result.stats.evals.items():
         console.print(f"[bold]{_format_group_title(evals_key, job_result)}[/bold]")
 
@@ -261,10 +303,87 @@ def print_job_results_tables(job_result) -> None:
             reward_table = Table(show_header=True)
             reward_table.add_column("Reward")
             reward_table.add_column("Count", justify="right")
-            for reward_key, reward_values in dataset_stats.reward_stats.items():
+            round_keys = sorted(
+                [
+                    reward_key
+                    for reward_key in dataset_stats.reward_stats
+                    if re.fullmatch(r"round_\d+", reward_key)
+                ],
+                key=_round_key_order,
+            )
+            has_multiround_rewards = len(round_keys) > 0
+
+            ordered_reward_keys: list[str] = []
+            ordered_reward_keys.extend(round_keys)
+            if "reward" in dataset_stats.reward_stats:
+                ordered_reward_keys.append("reward")
+            ordered_reward_keys.extend(
+                sorted(
+                    reward_key
+                    for reward_key in dataset_stats.reward_stats
+                    if reward_key not in set(ordered_reward_keys)
+                )
+            )
+
+            for reward_key in ordered_reward_keys:
+                reward_values = dataset_stats.reward_stats[reward_key]
+                label = (
+                    "final_reward"
+                    if reward_key == "reward" and has_multiround_rewards
+                    else reward_key
+                )
+
+                if has_multiround_rewards:
+                    total_count = sum(
+                        len(trial_names) for trial_names in reward_values.values()
+                    )
+                    numeric_entries: list[tuple[float, int]] = []
+                    for reward_value, trial_names in reward_values.items():
+                        numeric_value = _reward_to_float(reward_value)
+                        if numeric_value is None:
+                            numeric_entries = []
+                            break
+                        numeric_entries.append((numeric_value, len(trial_names)))
+
+                    if total_count > 0 and numeric_entries:
+                        mean_reward = (
+                            sum(value * count for value, count in numeric_entries)
+                            / total_count
+                        )
+                        reward_table.add_row(
+                            f"{label} mean",
+                            f"{mean_reward:.3f} (n={total_count})",
+                        )
+
+                        is_binary_reward = all(
+                            value in (0.0, 1.0) for value, _ in numeric_entries
+                        )
+                        if is_binary_reward:
+                            success_count = sum(
+                                count
+                                for value, count in numeric_entries
+                                if value == 1.0
+                            )
+                            success_rate = success_count / total_count
+                            reward_table.add_row(
+                                f"{label} success",
+                                f"{success_count}/{total_count} ({success_rate:.1%})",
+                            )
+                        continue
+
+                    bins = ", ".join(
+                        f"{reward_value}:{len(trial_names)}"
+                        for reward_value, trial_names in sorted(
+                            reward_values.items(),
+                            key=lambda item: _reward_value_sort_key(item[0]),
+                        )
+                    )
+                    reward_table.add_row(f"{label} bins", bins if bins else "-")
+                    continue
+
                 for reward_value, trial_names in reward_values.items():
                     count = len(trial_names)
-                    reward_table.add_row(str(reward_value), str(count))
+                    reward_table.add_row(f"{label} = {reward_value}", str(count))
             console.print()
             console.print(reward_table)
 
@@ -286,6 +405,592 @@ def print_job_results_tables(job_result) -> None:
 
 def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
+
+
+def _refresh_latest_snapshot_alias(trial_dir: Path, round_num: int) -> None:
+    trial_paths = TrialPaths(trial_dir)
+    round_snapshot_path = trial_paths.round_state_snapshot_path(round_num)
+    round_archive_path = trial_paths.round_state_image_archive_path(round_num)
+    latest_snapshot_path = trial_paths.state_snapshot_path
+    latest_archive_path = trial_paths.state_image_archive_path
+
+    if not round_snapshot_path.exists():
+        return
+
+    snapshot_payload = json.loads(round_snapshot_path.read_text())
+    snapshot_payload["archive_path"] = str(latest_archive_path.expanduser().absolute())
+    latest_snapshot_path.write_text(json.dumps(snapshot_payload, indent=2))
+
+    if latest_archive_path.exists() or latest_archive_path.is_symlink():
+        latest_archive_path.unlink()
+
+    if not round_archive_path.exists():
+        return
+
+    try:
+        latest_archive_path.symlink_to(
+            round_archive_path.relative_to(latest_archive_path.parent)
+        )
+    except OSError:
+        shutil.copy2(round_archive_path, latest_archive_path)
+
+
+def _cleanup_trial_for_resume(trial_dir: Path, from_round: int) -> None:
+    """Clean an existing trial directory before writing an in-place resume."""
+    for name in ("result.json", "config.json", "trial.log", "exception.txt"):
+        path = trial_dir / name
+        if path.exists():
+            path.unlink()
+
+    verifier_dir = trial_dir / "verifier"
+    if verifier_dir.exists():
+        for item in verifier_dir.iterdir():
+            if item.name.startswith("round_"):
+                parts = item.name.split("_", 2)
+                if len(parts) >= 2:
+                    try:
+                        if int(parts[1]) >= from_round:
+                            item.unlink()
+                    except ValueError:
+                        pass
+
+        for name in (
+            "multiround_results.json",
+            "reward.txt",
+            "reward.json",
+            "test-stdout.txt",
+            "test-stderr.txt",
+            "test-exit-code.txt",
+            "test_output.txt",
+            "verification-error.txt",
+        ):
+            (verifier_dir / name).unlink(missing_ok=True)
+
+    agent_dir = trial_dir / "agent"
+    if agent_dir.exists():
+        for item in agent_dir.iterdir():
+            name = item.name
+            if name.startswith("round-") and "-command-" in name:
+                try:
+                    round_num = int(name.split("-")[1])
+                    if round_num >= from_round:
+                        shutil.rmtree(item) if item.is_dir() else item.unlink()
+                except (ValueError, IndexError):
+                    pass
+                continue
+
+            if name.startswith("claude-code-round-"):
+                try:
+                    round_num = int(name.replace("claude-code-round-", "").split(".")[0])
+                    if round_num >= from_round:
+                        item.unlink()
+                except (ValueError, IndexError):
+                    pass
+                continue
+
+            if name.startswith("round_") and (
+                name.endswith("_oracle.txt") or name.endswith("_exit-code.txt")
+            ):
+                parts = name.split("_", 2)
+                if len(parts) >= 2:
+                    try:
+                        if int(parts[1]) >= from_round:
+                            item.unlink(missing_ok=True)
+                    except ValueError:
+                        pass
+                continue
+
+            if name in ("session_snapshots", "runtime_snapshots") and item.is_dir():
+                for entry in item.iterdir():
+                    if not entry.is_dir() or not entry.name.startswith("round_"):
+                        shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+                        continue
+                    try:
+                        round_num = int(entry.name.split("_", 1)[1])
+                    except ValueError:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        continue
+                    if round_num >= from_round:
+                        shutil.rmtree(entry, ignore_errors=True)
+                continue
+
+            if name in ("install.sh", "setup"):
+                continue
+            if name == "claude-code.txt" and from_round > 1:
+                continue
+
+            shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink(
+                missing_ok=True
+            )
+
+    state_dir = trial_dir / "state"
+    if state_dir.exists():
+        preserved_rounds: list[int] = []
+
+        for name in ("snapshot.json", "snapshot-image.tar"):
+            path = state_dir / name
+            if path.exists() or path.is_symlink():
+                path.unlink()
+
+        for entry in state_dir.iterdir():
+            if not entry.is_dir() or not entry.name.startswith("round_"):
+                continue
+            try:
+                round_num = int(entry.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            if round_num >= from_round:
+                shutil.rmtree(entry, ignore_errors=True)
+                continue
+            if (entry / "snapshot.json").exists():
+                preserved_rounds.append(round_num)
+
+        if preserved_rounds:
+            _refresh_latest_snapshot_alias(trial_dir, max(preserved_rounds))
+
+
+def _looks_like_trial_output_dir(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        TrialConfig.model_validate_json(config_path.read_text())
+    except Exception:
+        return False
+    return True
+
+
+def _resume_source_has_successful_round(
+    resume_trial_dir: Path, *, start_round: int
+) -> bool:
+    result_path = resume_trial_dir / "result.json"
+    if not result_path.exists():
+        return False
+
+    try:
+        result_payload = json.loads(result_path.read_text())
+    except Exception:
+        return False
+
+    if result_payload.get("exception_info") is not None:
+        return False
+
+    verifier_result = result_payload.get("verifier_result")
+    if not isinstance(verifier_result, dict):
+        return False
+    rewards = verifier_result.get("rewards")
+    if not isinstance(rewards, dict):
+        return False
+
+    round_reward = rewards.get(f"round_{start_round - 1}")
+    if round_reward is None and start_round == 2:
+        round_reward = rewards.get("reward")
+    if round_reward is None:
+        return False
+
+    try:
+        return float(round_reward) == 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _resume_source_has_snapshot_image(
+    resume_trial_dir: Path, *, start_round: int
+) -> bool:
+    snapshot_meta_path = _resolve_resume_snapshot_metadata_path(
+        resume_trial_dir,
+        start_round=start_round,
+    )
+    if snapshot_meta_path is None:
+        return False
+
+    try:
+        snapshot_meta = json.loads(snapshot_meta_path.read_text())
+    except Exception:
+        return False
+
+    image_ref = snapshot_meta.get("image_tag") or snapshot_meta.get("image_ref")
+    return isinstance(image_ref, str) and bool(image_ref.strip())
+
+
+def _resume_source_matches_completed_round(
+    resume_trial_dir: Path, *, start_round: int
+) -> bool:
+    completed_round = start_round - 1
+    if completed_round < 1:
+        return True
+
+    latest_round = _resolve_resume_source_latest_round(resume_trial_dir)
+    if latest_round is None:
+        return True
+    return latest_round == completed_round
+
+
+def _resolve_resume_trial_dir(resume_path: Path, *, start_round: int) -> Path:
+    resolved_path = resume_path.resolve()
+    if not resolved_path.exists():
+        raise ValueError(f"Resume trial directory does not exist: {resolved_path}")
+
+    if _looks_like_trial_output_dir(resolved_path):
+        return resolved_path
+
+    if not resolved_path.is_dir():
+        raise ValueError(f"Resume path is not a directory: {resolved_path}")
+
+    candidate_dirs = sorted(
+        (
+            child
+            for child in resolved_path.iterdir()
+            if _looks_like_trial_output_dir(child)
+            and _resume_source_matches_completed_round(
+                child, start_round=start_round
+            )
+            and _resume_source_has_successful_round(child, start_round=start_round)
+            and _resume_source_has_snapshot_image(child, start_round=start_round)
+        ),
+        key=lambda path: path.name,
+    )
+    if candidate_dirs:
+        return candidate_dirs[0]
+
+    raise ValueError(
+        "--resume-trial did not resolve to a usable trial directory. "
+        "If you pass a job/timestamp directory, it must contain at least one child "
+        "trial whose latest completed round matches the requested resume source, "
+        "whose previous round succeeded, and which has snapshot image metadata. "
+        f"Path: {resolved_path}"
+    )
+
+
+def _load_resume_source_trial_config(resume_trial_dir: Path) -> TrialConfig:
+    config_path = resume_trial_dir / "config.json"
+    if not config_path.exists():
+        raise ValueError(
+            "--resume-trial requires an existing config.json in the source trial: "
+            f"{resume_trial_dir}"
+        )
+
+    try:
+        return TrialConfig.model_validate_json(config_path.read_text())
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to read source trial config from {config_path}: {exc}"
+        ) from exc
+
+
+def _load_resume_source_task_checksum(resume_trial_dir: Path) -> str | None:
+    result_path = resume_trial_dir / "result.json"
+    if not result_path.exists():
+        return None
+
+    try:
+        result_payload = json.loads(result_path.read_text())
+    except Exception:
+        return None
+
+    task_checksum = result_payload.get("task_checksum")
+    return task_checksum if isinstance(task_checksum, str) and task_checksum else None
+
+
+def _is_volatile_task_artifact(relative_path: Path) -> bool:
+    for part in relative_path.parts:
+        if part.startswith("creating_"):
+            return True
+        if part in _VOLATILE_TASK_DIR_NAMES:
+            return True
+
+    return relative_path.name in _VOLATILE_TASK_FILE_NAMES
+
+
+def _compute_task_definition_checksum(task_dir: Path) -> str:
+    digest = hashlib.sha256()
+
+    for path in sorted(task_dir.rglob("*")):
+        if not path.is_file():
+            continue
+
+        relative_path = path.relative_to(task_dir)
+        if _is_volatile_task_artifact(relative_path):
+            continue
+
+        digest.update(relative_path.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+
+    return digest.hexdigest()
+
+
+def _resolve_resume_source_latest_round(resume_trial_dir: Path) -> int | None:
+    trial_paths = TrialPaths(resume_trial_dir)
+    latest_snapshot_path = trial_paths.state_snapshot_path
+    if latest_snapshot_path.exists():
+        try:
+            latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
+        except Exception:
+            latest_snapshot_payload = {}
+
+        latest_round = latest_snapshot_payload.get("round")
+        if isinstance(latest_round, int):
+            return latest_round
+
+    round_results_path = trial_paths.verifier_dir / "multiround_results.json"
+    if not round_results_path.exists():
+        return None
+
+    try:
+        round_results = json.loads(round_results_path.read_text())
+    except Exception:
+        return None
+
+    rounds = [
+        round_num
+        for item in round_results
+        if isinstance(item, dict)
+        for round_num in [item.get("round")]
+        if isinstance(round_num, int)
+    ]
+    return max(rounds) if rounds else None
+
+
+def _resolve_resume_snapshot_metadata_path(
+    resume_trial_dir: Path, *, start_round: int
+) -> Path | None:
+    trial_paths = TrialPaths(resume_trial_dir)
+    completed_round = start_round - 1
+
+    if completed_round >= 1:
+        round_snapshot_path = trial_paths.round_state_snapshot_path(completed_round)
+        if round_snapshot_path.exists():
+            return round_snapshot_path
+
+        latest_snapshot_path = trial_paths.state_snapshot_path
+        if latest_snapshot_path.exists():
+            try:
+                latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
+            except Exception:
+                latest_snapshot_payload = {}
+            latest_round = latest_snapshot_payload.get("round")
+            if latest_round in (None, completed_round):
+                return latest_snapshot_path
+        return None
+
+    latest_snapshot_path = trial_paths.state_snapshot_path
+    if latest_snapshot_path.exists():
+        return latest_snapshot_path
+    return None
+
+
+def _resolve_resume_claude_sessions_dir(
+    resume_trial_dir: Path, *, start_round: int
+) -> Path | None:
+    trial_paths = TrialPaths(resume_trial_dir)
+    completed_round = start_round - 1
+    if completed_round < 1:
+        return None
+
+    round_sessions_dir = trial_paths.agent_round_sessions_dir(completed_round)
+    if round_sessions_dir.exists():
+        return round_sessions_dir
+
+    latest_sessions_dir = trial_paths.agent_sessions_dir
+    if not latest_sessions_dir.exists():
+        return None
+
+    latest_round = _resolve_resume_source_latest_round(resume_trial_dir)
+    if latest_round != completed_round:
+        return None
+    return latest_sessions_dir
+
+
+def _resolve_resume_terminus_runtime_state_path(
+    resume_trial_dir: Path, *, start_round: int
+) -> Path | None:
+    trial_paths = TrialPaths(resume_trial_dir)
+    completed_round = start_round - 1
+    if completed_round < 1:
+        return None
+
+    round_state_path = trial_paths.terminus_round_runtime_state_path(completed_round)
+    if round_state_path.exists():
+        return round_state_path
+    return None
+
+
+def _validate_resume_task_identity(
+    target_task: Task,
+    target_task_config: TaskConfig,
+    resume_trial_dir: Path,
+) -> None:
+    source_trial_config = _load_resume_source_trial_config(resume_trial_dir)
+
+    source_task_path = source_trial_config.task.path
+    if source_task_path is not None and source_task_path.exists():
+        source_checksum = _compute_task_definition_checksum(source_task_path)
+        target_checksum = _compute_task_definition_checksum(target_task.task_dir)
+        if source_checksum != target_checksum:
+            raise ValueError(
+                "--resume-trial source task does not match the current task. "
+                "Resume requires the same task definition."
+            )
+        return
+
+    source_checksum = _load_resume_source_task_checksum(resume_trial_dir)
+    if source_checksum is None and source_trial_config.task.path is not None:
+        try:
+            source_checksum = Task(source_trial_config.task.path).checksum
+        except Exception:
+            source_checksum = None
+
+    if source_checksum is not None:
+        if source_checksum != target_task.checksum:
+            raise ValueError(
+                "--resume-trial source task does not match the current task. "
+                "Resume requires the same task definition."
+            )
+        return
+
+    if source_trial_config.task.get_task_id() != target_task_config.get_task_id():
+        raise ValueError(
+            "--resume-trial source task does not match the current task. "
+            "Resume requires the same task definition."
+        )
+
+
+def _preflight_multiround_resume_source(
+    *,
+    resume_trial_dir: Path,
+    start_round: int,
+    target_agent_config: AgentConfig,
+    policy: str,
+) -> None:
+    if policy == "off":
+        return
+
+    snapshot_meta_path = _resolve_resume_snapshot_metadata_path(
+        resume_trial_dir,
+        start_round=start_round,
+    )
+    if snapshot_meta_path is None:
+        raise ValueError(
+            "--resume-trial preflight failed: no matching resume snapshot metadata "
+            f"was found for round {start_round - 1} in {resume_trial_dir}"
+        )
+
+    try:
+        snapshot_payload = json.loads(snapshot_meta_path.read_text())
+    except Exception as exc:
+        raise ValueError(
+            "--resume-trial preflight failed: could not read resume snapshot metadata "
+            f"from {snapshot_meta_path}: {exc}"
+        ) from exc
+
+    if not (snapshot_payload.get("image_tag") or snapshot_payload.get("image_ref")):
+        raise ValueError(
+            "--resume-trial preflight failed: resume snapshot metadata does not "
+            f"contain an image reference: {snapshot_meta_path}"
+        )
+
+    if policy == "snapshot":
+        return
+
+    source_trial_config = _load_resume_source_trial_config(resume_trial_dir)
+    source_agent_name = AgentFactory.get_agent_class_from_config(
+        source_trial_config.agent
+    ).name()
+    target_agent_name = AgentFactory.get_agent_class_from_config(
+        target_agent_config
+    ).name()
+
+    if (
+        source_agent_name == AgentName.ORACLE.value
+        and target_agent_name != AgentName.ORACLE.value
+    ):
+        return
+
+    completed_round = start_round - 1
+    if target_agent_name == AgentName.CLAUDE_CODE.value:
+        if (
+            _resolve_resume_claude_sessions_dir(
+                resume_trial_dir,
+                start_round=start_round,
+            )
+            is None
+        ):
+            raise ValueError(
+                "--resume-trial preflight failed: no Claude session snapshot was "
+                f"found for round {completed_round} in {resume_trial_dir}"
+            )
+    elif target_agent_name == AgentName.TERMINUS_2.value:
+        if (
+            _resolve_resume_terminus_runtime_state_path(
+                resume_trial_dir,
+                start_round=start_round,
+            )
+            is None
+        ):
+            raise ValueError(
+                "--resume-trial preflight failed: no Terminus-2 runtime snapshot was "
+                f"found for round {completed_round} in {resume_trial_dir}"
+            )
+
+
+def _validate_resume_agent_transition(
+    target_agent_config: AgentConfig, resume_trial_dir: Path
+) -> None:
+    source_trial_config = _load_resume_source_trial_config(resume_trial_dir)
+
+    target_agent_name = AgentFactory.get_agent_class_from_config(target_agent_config).name()
+    source_agent_name = AgentFactory.get_agent_class_from_config(
+        source_trial_config.agent
+    ).name()
+
+    if source_agent_name == target_agent_name:
+        return
+
+    if source_agent_name == AgentName.ORACLE.value:
+        return
+
+    if target_agent_name == AgentName.ORACLE.value:
+        raise ValueError(
+            "--resume-trial does not support resuming into oracle from a non-oracle "
+            "source. Oracle can prepare later rounds, but it does not consume another "
+            "agent's continuation state. Use --start-round N for the default "
+            "Oracle-prepared late-round start."
+        )
+
+    raise ValueError(
+        "--resume-trial only supports same-agent continuation, plus oracle -> "
+        "target-agent handoff. "
+        f"Got source agent '{source_agent_name}' and target agent "
+        f"'{target_agent_name}'."
+    )
+
+
+def _validate_resume_shape(config: JobConfig) -> None:
+    if len(config.agents) != 1:
+        raise ValueError("--resume-trial requires exactly one agent")
+
+
+def _would_enable_roundwise_multiround_attempt_selection(config: JobConfig) -> bool:
+    if config.n_attempts <= 1:
+        return False
+    if (config.jobs_dir / config.job_name / "result.json").exists():
+        return False
+
+    task_configs = list(config.tasks)
+    if not task_configs or config.datasets:
+        return False
+
+    for task_config in task_configs:
+        if task_config.is_git_task() or task_config.path is None:
+            return False
+        if not Task(task_config.path).is_multiround:
+            return False
+
+    return True
 
 
 def _harbor_hub_visibility(public: bool | None):
@@ -985,6 +1690,106 @@ def start(
             show_default=False,
         ),
     ] = False,
+    multiround_continue_successes_per_round: Annotated[
+        int | None,
+        Option(
+            "--multiround-continue-successes-per-round",
+            help="In multi-round mode with --n-attempts > 1, number of successful "
+            "trajectories selected per round to continue to the next round.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    multiround_state_cache_policy: Annotated[
+        str | None,
+        Option(
+            "--multiround-state-cache-policy",
+            help="Container state snapshot caching policy: off, success, or all.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    multiround_resume_preflight_policy: Annotated[
+        str | None,
+        Option(
+            "--multiround-resume-preflight-policy",
+            help="Resume preflight policy for multi-round resume: off, snapshot, or strict.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    max_round: Annotated[
+        int | None,
+        Option(
+            "--max-round",
+            help="Maximum round number to execute.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    multiround_aggregate_start_round: Annotated[
+        int | None,
+        Option(
+            "--multiround-aggregate-start-round",
+            help="Override the first round included in final multi-round reward aggregation.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    multiround_aggregate_end_round: Annotated[
+        int | None,
+        Option(
+            "--multiround-aggregate-end-round",
+            help="Override the last round included in final multi-round reward aggregation.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    start_round: Annotated[
+        int | None,
+        Option(
+            "--start-round",
+            help="Start from round N after fast-forwarding earlier rounds with oracle solutions.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    resume_trial: Annotated[
+        Path | None,
+        Option(
+            "--resume-trial",
+            help="Existing trial or job directory to resume from.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    resume_round: Annotated[
+        int | None,
+        Option(
+            "--resume-round",
+            help="Round number to resume from; requires --resume-trial.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
+    no_resume_backup: Annotated[
+        bool,
+        Option(
+            "--no-resume-backup",
+            help="Skip creating __resumed_<timestamp> backup dirs for in-place resume.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = False,
+    output_jobs_dir: Annotated[
+        Path | None,
+        Option(
+            "--output-jobs-dir",
+            help="Write resume output to this jobs directory instead of modifying the source trial.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
     upload: Annotated[
         bool,
         Option(
@@ -1156,6 +1961,85 @@ def start(
     if disable_verification:
         config.verifier.disable = disable_verification
 
+    if multiround_continue_successes_per_round is not None:
+        if multiround_continue_successes_per_round < 1:
+            raise ValueError(
+                "--multiround-continue-successes-per-round must be >= 1"
+            )
+        config.verifier.multiround_continue_successes_per_round = (
+            multiround_continue_successes_per_round
+        )
+
+    if multiround_state_cache_policy is not None:
+        allowed_policies = {"off", "success", "all"}
+        if multiround_state_cache_policy not in allowed_policies:
+            raise ValueError(
+                "--multiround-state-cache-policy must be one of: off, success, all"
+            )
+        config.verifier.multiround_state_cache_policy = multiround_state_cache_policy
+
+    if multiround_resume_preflight_policy is not None:
+        allowed_preflight_policies = {"off", "snapshot", "strict"}
+        if multiround_resume_preflight_policy not in allowed_preflight_policies:
+            raise ValueError(
+                "--multiround-resume-preflight-policy must be one of: "
+                "off, snapshot, strict"
+            )
+        config.verifier.multiround_resume_preflight_policy = (
+            multiround_resume_preflight_policy
+        )
+
+    pending_resume: tuple[Path, int] | None = None
+
+    if resume_round is not None and resume_trial is None:
+        raise ValueError("--resume-round requires --resume-trial")
+
+    if resume_trial is not None:
+        if resume_round is None:
+            raise ValueError("--resume-trial requires --resume-round")
+        if resume_round < 2:
+            raise ValueError("--resume-round must be >= 2")
+        if start_round is not None:
+            raise ValueError(
+                "--start-round and --resume-trial are mutually exclusive "
+                "(--resume-trial sets start_round automatically)"
+            )
+        pending_resume = (resume_trial, resume_round)
+
+    if start_round is not None and resume_trial is None:
+        if start_round < 1:
+            raise ValueError("--start-round must be >= 1")
+        config.verifier.multiround_start_round = start_round
+
+    if max_round is not None:
+        if max_round < 1:
+            raise ValueError("--max-round must be >= 1")
+        config.verifier.multiround_max_round = max_round
+
+    if multiround_aggregate_start_round is not None:
+        if multiround_aggregate_start_round < 1:
+            raise ValueError("--multiround-aggregate-start-round must be >= 1")
+        config.verifier.multiround_aggregate_start_round = (
+            multiround_aggregate_start_round
+        )
+
+    if multiround_aggregate_end_round is not None:
+        if multiround_aggregate_end_round < 1:
+            raise ValueError("--multiround-aggregate-end-round must be >= 1")
+        config.verifier.multiround_aggregate_end_round = (
+            multiround_aggregate_end_round
+        )
+
+    effective_start = config.verifier.multiround_start_round or 1
+    if (
+        config.verifier.multiround_max_round is not None
+        and effective_start > config.verifier.multiround_max_round
+    ):
+        raise ValueError(
+            f"--start-round ({effective_start}) must be <= "
+            f"--max-round ({config.verifier.multiround_max_round})"
+        )
+
     if artifact_paths is not None:
         config.artifacts = list(artifact_paths)
 
@@ -1254,6 +2138,165 @@ def start(
                 "--exclude-task-name without also specifying --dataset, --task, or --path."
             )
 
+    task_configs = list(config.tasks)
+    if config.verifier.multiround_start_round is not None:
+        start_round_value = config.verifier.multiround_start_round
+        for task_config in task_configs:
+            if task_config.is_git_task() or task_config.path is None:
+                continue
+            task = Task(task_config.path)
+            if start_round_value > task.num_rounds:
+                raise ValueError(
+                    f"--start-round ({start_round_value}) must be <= "
+                    f"the task's num_rounds ({task.num_rounds}) for task '{task.name}'"
+                )
+
+    for task_config in task_configs:
+        if task_config.is_git_task() or task_config.path is None:
+            continue
+
+        task = Task(task_config.path)
+        if task.is_multiround and config.verifier.disable:
+            raise ValueError(
+                "--disable-verification is not supported for multi-round tasks. "
+                "Multi-round reward aggregation and fanout selection require "
+                "per-round verification."
+            )
+
+        aggregate_start = config.verifier.multiround_aggregate_start_round
+        aggregate_end = config.verifier.multiround_aggregate_end_round
+        if aggregate_start is not None and aggregate_start > task.num_rounds:
+            raise ValueError(
+                f"--multiround-aggregate-start-round ({aggregate_start}) must be <= "
+                f"the task's num_rounds ({task.num_rounds}) for task '{task.name}'"
+            )
+        if aggregate_end is not None and aggregate_end > task.num_rounds:
+            raise ValueError(
+                f"--multiround-aggregate-end-round ({aggregate_end}) must be <= "
+                f"the task's num_rounds ({task.num_rounds}) for task '{task.name}'"
+            )
+        if (
+            aggregate_start is not None
+            and aggregate_end is not None
+            and aggregate_start > aggregate_end
+        ):
+            raise ValueError(
+                f"--multiround-aggregate-start-round ({aggregate_start}) must be <= "
+                f"--multiround-aggregate-end-round ({aggregate_end})"
+            )
+
+    if output_jobs_dir is not None and pending_resume is None:
+        raise ValueError("--output-jobs-dir requires --resume-trial")
+
+    if pending_resume is not None:
+        resume_trial_path, resolved_resume_round = pending_resume
+
+        _validate_resume_shape(config)
+
+        if config.datasets:
+            raise ValueError(
+                "--resume-trial is not supported when running a dataset or multiple "
+                "tasks; resume requires a single task job"
+            )
+
+        if len(config.tasks) != 1 or config.tasks[0].path is None:
+            raise ValueError(
+                "--resume-trial requires exactly one local task in the job configuration"
+            )
+
+        resolved_resume = _resolve_resume_trial_dir(
+            resume_trial_path,
+            start_round=resolved_resume_round,
+        )
+
+        task = Task(config.tasks[0].path)
+        _validate_resume_task_identity(task, config.tasks[0], resolved_resume)
+        if resolved_resume_round > task.num_rounds:
+            raise ValueError(
+                f"--resume-round ({resolved_resume_round}) must be <= "
+                f"the task's num_rounds ({task.num_rounds})"
+            )
+
+        if (
+            config.verifier.multiround_max_round is not None
+            and resolved_resume_round > config.verifier.multiround_max_round
+        ):
+            raise ValueError(
+                f"--resume-round ({resolved_resume_round}) must be <= "
+                f"--max-round ({config.verifier.multiround_max_round})"
+            )
+
+        for agent_config in config.agents:
+            _validate_resume_agent_transition(agent_config, resolved_resume)
+            _preflight_multiround_resume_source(
+                resume_trial_dir=resolved_resume,
+                start_round=resolved_resume_round,
+                target_agent_config=agent_config,
+                policy=config.verifier.multiround_resume_preflight_policy,
+            )
+
+        trial_parent = resolved_resume.parent
+        inferred_jobs_dir = trial_parent.parent
+        inferred_job_name = trial_parent.name
+        resume_trial_name = resolved_resume.name
+
+        if output_jobs_dir is not None:
+            config.jobs_dir = output_jobs_dir
+            resume_source_dir = resolved_resume
+            resume_trial_name_for_config = None
+        else:
+            if jobs_dir is not None and jobs_dir.resolve() != inferred_jobs_dir.resolve():
+                raise ValueError(
+                    f"-o ({jobs_dir.resolve()}) conflicts with --resume-trial path "
+                    f"(inferred jobs_dir: {inferred_jobs_dir})"
+                )
+
+            config.jobs_dir = inferred_jobs_dir
+            config.job_name = inferred_job_name
+            resume_trial_name_for_config = resume_trial_name
+
+            if no_resume_backup:
+                verifier_dir = resolved_resume / "verifier"
+                saved_multiround_results = None
+                mr_path = verifier_dir / "multiround_results.json"
+                if mr_path.exists():
+                    saved_multiround_results = mr_path.read_bytes()
+
+                _cleanup_trial_for_resume(resolved_resume, resolved_resume_round)
+
+                if saved_multiround_results is not None:
+                    mr_path.parent.mkdir(parents=True, exist_ok=True)
+                    mr_path.write_bytes(saved_multiround_results)
+
+                resume_source_dir = resolved_resume
+            else:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_dir = trial_parent / f"{resume_trial_name}__resumed_{ts}"
+                shutil.copytree(resolved_resume, backup_dir, symlinks=True)
+                _cleanup_trial_for_resume(resolved_resume, resolved_resume_round)
+                resume_source_dir = backup_dir
+
+            for name in ("result.json", "config.json"):
+                path_to_remove = trial_parent / name
+                if path_to_remove.exists():
+                    path_to_remove.unlink()
+
+        config.verifier.multiround_start_round = resolved_resume_round
+        config.verifier.multiround_resume_source = str(resume_source_dir)
+        config.verifier.multiround_resume_trial_name = resume_trial_name_for_config
+
+    if (
+        config.verifier.multiround_state_cache_policy == "off"
+        and _would_enable_roundwise_multiround_attempt_selection(config)
+    ):
+        raise ValueError(
+            "-k/--n-attempts > 1 with --multiround-state-cache-policy off "
+            "is only unsupported when round-wise multi-round attempt selection "
+            "would be enabled: fanout child trials require parent snapshots "
+            "which are never saved under policy 'off'. "
+            "Use 'success' (default) or 'all' instead."
+        )
+
     async def _run_job():
         from harbor.cli.job_sharing import (
             confirm_non_member_org_shares,
@@ -1294,9 +2337,12 @@ def start(
         print_job_results_tables(job_result)
         console.print("[bold]Job Info[/bold]")
         console.print(
-            f"Total runtime: {_format_duration(job_result.started_at, job_result.finished_at)}"
+            "Total runtime: "
+            f"{_format_duration(getattr(job_result, 'started_at', None), getattr(job_result, 'finished_at', None))}"
         )
-        console.print(f"Results written to {job._job_result_path}")
+        console.print(
+            f"Results written to {getattr(job, '_job_result_path', job.job_dir / 'result.json')}"
+        )
         console.print(f"Inspect results by running `harbor view {job.job_dir.parent}`")
 
         # Finalize must run on the same event loop as `_setup_harbor_hub_streaming`

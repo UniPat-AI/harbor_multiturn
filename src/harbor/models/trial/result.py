@@ -66,6 +66,16 @@ class StepResult(BaseModel):
     verifier: TimingInfo | None = None
 
 
+class EnvironmentStateInfo(BaseModel):
+    """Container/environment state lineage metadata for multi-round continuation."""
+
+    snapshot_id: str | None = None
+    image_ref: str | None = None
+    image_archive: str | None = None
+    parent_snapshot_id: str | None = None
+    source: str | None = None
+
+
 class TrialResult(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     task_name: str
@@ -79,6 +89,7 @@ class TrialResult(BaseModel):
     agent_result: AgentContext | None = None
     verifier_result: VerifierResult | None = None
     exception_info: ExceptionInfo | None = None
+    environment_state: EnvironmentStateInfo | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     environment_setup: TimingInfo | None = None

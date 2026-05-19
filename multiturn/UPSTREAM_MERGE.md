@@ -23,31 +23,37 @@ multiturn/main       # moving integration branch: merge origin/main, repair over
 
 Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support` available so a regression in the merged integration branch can be bisected or rolled back without hunting through merge commits.
 
-## Fixed Dry-Run Merge
+## Optional Manual Rehearsal
 
-Before mutating `multiturn/main`, rehearse the upstream merge in one fixed
-detached worktree. This creates no branch:
+Before mutating `multiturn/main`, the maintainer may manually rehearse the
+upstream merge in a detached worktree. This is optional and creates no branch:
 
 ```bash
 cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
-bash tests/upstream_merge_dry_run.sh
+git -C harbor fetch origin --prune
+git -C harbor worktree add --detach data/maintenance/upstream_merge_dry_run/harbor multiturn/main
+cd data/maintenance/upstream_merge_dry_run/harbor
+git merge --no-commit --no-ff origin/main
 ```
 
-Defaults:
+If the rehearsal merge is useful, inspect conflicts and run the deterministic
+gate from the parent directory with `HARBOR_DIR` pointed at the detached
+worktree:
 
-```text
-BASE_BRANCH=multiturn/main
-UPSTREAM_REMOTE=origin
-UPSTREAM_BRANCH=main
-DRY_RUN_WORKTREE=data/maintenance/upstream_merge_dry_run/harbor
+```bash
+cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
+HARBOR_DIR=$PWD/data/maintenance/upstream_merge_dry_run/harbor \
+  bash tests/run_multiturn_maintenance.sh
 ```
 
-The script creates a detached worktree from `multiturn/main`, merges
-`origin/main --no-commit --no-ff` inside that worktree, and runs the
-deterministic maintenance gate with `HARBOR_DIR` pointed at the worktree unless
-`--no-tests` is passed. It leaves the merge uncommitted so a human or agent can
-inspect conflicts and semantic changes. Reusing this worktree keeps the
-repository from accumulating one-off temporary branches.
+Discard the rehearsal after inspection:
+
+```bash
+git -C harbor worktree remove --force data/maintenance/upstream_merge_dry_run/harbor
+```
+
+Do not keep a rehearsal branch. The maintained branch set remains
+`origin/main`, `multi_turn_support`, and `multiturn/main`.
 
 ## Standard Update
 
@@ -114,7 +120,7 @@ Common conflict zones:
 
 For each upstream Harbor update:
 
-1. Run the fixed dry-run merge and inspect the resulting tree.
+1. Optionally rehearse the merge in a detached worktree and inspect the resulting tree.
 2. Backup `multiturn/main` with a branch and tag before the real merge.
 3. Merge `origin/main` into `multiturn/main`.
 4. Resolve conflicts by keeping upstream structure first, then reapplying multiturn hooks.

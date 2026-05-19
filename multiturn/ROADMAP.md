@@ -1,0 +1,94 @@
+# Multiturn Roadmap
+
+This roadmap tracks the local multiturn Harbor overlay. It is scoped to
+`multiturn/main` and keeps the current public contract stable while reducing
+future upstream merge cost.
+
+## Compatibility Contract
+
+All roadmap items are additive or internal unless a future document explicitly
+marks a breaking change. The following interfaces stay compatible:
+
+- Existing `harbor run` CLI flags and current flag combinations.
+- Existing task layout: top-level `task.toml`, `round_N/instruction.md`,
+  `round_N/solution/solve.*`, and `round_N/tests/test.*`.
+- Existing persisted config fields under `verifier.multiround_*`.
+- Existing output paths under `verifier/`, `state/`, and `agent/`.
+- Existing black-box test entrypoints in the parent `tests/` directory.
+- Existing maintenance branch model: merge upstream `origin/main` into
+  `multiturn/main`; do not rebase the maintained integration branch.
+
+New behavior should be enabled by new flags, new optional metadata, or internal
+helpers with unchanged user-visible defaults.
+
+## P0: Lower Upstream Merge Friction
+
+Goal: keep multiturn behavior stable while shrinking the patch surface inside
+large upstream Harbor files.
+
+- Move pure resume output planning into `harbor.multiround.resume_plan`.
+- Keep `cli/jobs.py` responsible for existing CLI parsing, filesystem mutation,
+  backup, cleanup, and config persistence.
+- Add direct unit tests for resume planning so upstream CLI churn can be
+  audited separately from multiturn semantics.
+- Continue keeping multiturn docs and CI outside Harbor upstream docs/workflows.
+
+Current status:
+
+- Done: resume output planning lives in `harbor.multiround.resume_plan` with
+  direct unit coverage.
+- Next: apply the same pattern to roundwise fanout selection once upstream
+  merge pressure or feature work touches that area.
+
+## P1: Safer Resume Operations
+
+Goal: make resume intent easier to inspect before mutating a source trial.
+
+- Add a dry-run resume report that prints the resolved source trial, inferred
+  jobs directory, backup behavior, resume round, preflight policy, and snapshot
+  source.
+- Add an optional explicit resume mode flag while preserving today’s default:
+  in-place with automatic backup.
+- Keep `--output-jobs-dir` as the non-mutating copy mode and
+  `--no-resume-backup` as the expert in-place mode.
+- Extend black-box coverage when a new visible flag is added.
+
+## P2: Fanout Selection and Lineage Observability
+
+Goal: make MT@K selection behavior easier to audit without changing default
+ranking.
+
+- Isolate frontier selection into a pure planner module.
+- Keep current first-success parent selection as the default.
+- Add optional future selection policies only behind explicit flags.
+- Persist a compact lineage summary for each child trial and expose it to the
+  viewer without changing existing artifact paths.
+
+## P3: Artifact Schema and Viewer Support
+
+Goal: make generated task regressions and human debugging easier.
+
+- Add schema/golden tests for `multiround_results.json`, snapshot metadata,
+  resume lineage metadata, and trajectory round annotations.
+- Build a viewer-side multiturn summary from existing artifacts first.
+- Add optional richer viewer metadata after the summary is stable.
+
+## P4: Environment Snapshot Portability
+
+Goal: support more Harbor environments while preserving Docker behavior.
+
+- Keep Docker snapshot capture/restore as the reference implementation.
+- Add capability checks and clearer diagnostics for non-Docker environments.
+- Add remote-environment snapshot metadata only when an environment advertises
+  the capability.
+
+## P5: Maintenance Automation
+
+Goal: catch upstream Harbor drift earlier.
+
+- Keep the deterministic parent workflow as the required merge gate.
+- Add an optional scheduled upstream-merge dry run against `origin/main`.
+- Keep credentialed Terminus-2 MT@4 and SR tests as release-like validation
+  rather than mandatory pull-request CI.
+- Record only stable commands and current expected outputs in docs; do not store
+  run logs or credentials.

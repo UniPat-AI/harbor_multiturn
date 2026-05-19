@@ -11,6 +11,7 @@ This directory documents the local multiturnpp extension carried by the Harbor f
 | `IMPLEMENTATION.md` | Code map for the multiturn implementation inside current Harbor. |
 | `TESTING.md` | The continuous maintenance test loop based on the 3-round local task. |
 | `UPSTREAM_MERGE.md` | Branch model and merge workflow for keeping current with upstream Harbor. |
+| `ROADMAP.md` | Backward-compatible optimization plan for lowering upstream merge friction and expanding coverage. |
 
 ## Branch Model
 

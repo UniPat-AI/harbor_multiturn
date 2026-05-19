@@ -21,6 +21,7 @@ Responsibilities:
 Files:
 
 - `src/harbor/cli/jobs.py`
+- `src/harbor/multiround/resume_plan.py`
 - `src/harbor/models/trial/config.py`
 - `src/harbor/models/trial/paths.py`
 
@@ -28,6 +29,7 @@ Responsibilities:
 
 - Expose round window, resume, aggregate window, state cache, and fanout parameters.
 - Reject invalid multiturn combinations before jobs start.
+- Plan resume output mode, inferred jobs directory, job name, and backup naming without filesystem side effects.
 - Resolve in-place resume targets and snapshot source metadata.
 - Persist multiturn parameters to `config.json`.
 

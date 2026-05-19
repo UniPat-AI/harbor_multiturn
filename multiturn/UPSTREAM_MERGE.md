@@ -65,6 +65,7 @@ Common conflict zones:
 | --- | --- |
 | `src/harbor/models/task/task.py` | Keep upstream task features such as extra instructions, then preserve multiturn shape and round metadata validation. |
 | `src/harbor/cli/jobs.py` | Keep upstream CLI options and queue setup, then preserve multiturn validation and resume parameter plumbing. |
+| `src/harbor/multiround/` | Keep local pure helper modules here when possible so upstream Harbor file conflicts stay small. |
 | `src/harbor/job.py` | Keep upstream `TrialQueue` behavior, then preserve roundwise attempt selection. |
 | `src/harbor/trial/trial.py` | Keep upstream lifecycle setup, injected skills, hooks, and environment creation, then preserve resume snapshot resolution. |
 | `src/harbor/trial/single_step.py` | Preserve upstream single-step behavior for normal tasks; keep multiturn as a branch for `task.is_multiround`. |
@@ -76,6 +77,7 @@ Common conflict zones:
 - Keep local documentation in `multiturn/`; do not edit upstream `README.md` for local behavior.
 - Keep deterministic black-box maintenance tests in the parent `tests/` harness; do not duplicate them inside upstream Harbor examples.
 - Keep new local runtime behavior behind existing Harbor extension points.
+- Move pure multiturn planning and selection logic into `src/harbor/multiround/` when it does not need CLI or Trial side effects.
 - Avoid broad formatting rewrites in files that upstream changes frequently.
 - Use merge commits, not rebases, for `multiturn/main`.
 - Separate commits by purpose: upstream merge, local conflict repair, docs/tests.

@@ -35,6 +35,7 @@ from harbor.models.trial.config import (
 )
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
+from harbor.multiround.resume_plan import ResumeOutputMode, plan_resume_output
 
 jobs_app = Typer(
     no_args_is_help=True,
@@ -2297,27 +2298,21 @@ def start(
                 policy=config.verifier.multiround_resume_preflight_policy,
             )
 
-        trial_parent = resolved_resume.parent
-        inferred_jobs_dir = trial_parent.parent
-        inferred_job_name = trial_parent.name
-        resume_trial_name = resolved_resume.name
+        resume_plan = plan_resume_output(
+            resolved_resume=resolved_resume,
+            jobs_dir=jobs_dir,
+            output_jobs_dir=output_jobs_dir,
+            no_resume_backup=no_resume_backup,
+        )
 
-        if output_jobs_dir is not None:
-            config.jobs_dir = output_jobs_dir
-            resume_source_dir = resolved_resume
-            resume_trial_name_for_config = None
-        else:
-            if jobs_dir is not None and jobs_dir.resolve() != inferred_jobs_dir.resolve():
-                raise ValueError(
-                    f"-o ({jobs_dir.resolve()}) conflicts with --resume-trial path "
-                    f"(inferred jobs_dir: {inferred_jobs_dir})"
-                )
+        config.jobs_dir = resume_plan.jobs_dir
+        if resume_plan.job_name is not None:
+            config.job_name = resume_plan.job_name
+        resume_source_dir = resume_plan.resume_source_dir
+        resume_trial_name_for_config = resume_plan.resume_trial_name_for_config
 
-            config.jobs_dir = inferred_jobs_dir
-            config.job_name = inferred_job_name
-            resume_trial_name_for_config = resume_trial_name
-
-            if no_resume_backup:
+        if resume_plan.output_mode != ResumeOutputMode.COPY_TO_OUTPUT_JOBS_DIR:
+            if resume_plan.output_mode == ResumeOutputMode.IN_PLACE_WITHOUT_BACKUP:
                 verifier_dir = resolved_resume / "verifier"
                 saved_multiround_results = None
                 mr_path = verifier_dir / "multiround_results.json"
@@ -2333,13 +2328,13 @@ def start(
                 resume_source_dir = resolved_resume
             else:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_dir = trial_parent / f"{resume_trial_name}__resumed_{ts}"
+                backup_dir = resume_plan.backup_dir(ts)
                 shutil.copytree(resolved_resume, backup_dir, symlinks=True)
                 _cleanup_trial_for_resume(resolved_resume, resolved_resume_round)
                 resume_source_dir = backup_dir
 
             for name in ("result.json", "config.json", LOCK_FILENAME):
-                path_to_remove = trial_parent / name
+                path_to_remove = resume_plan.trial_parent / name
                 if path_to_remove.exists():
                     path_to_remove.unlink()
 

@@ -66,7 +66,13 @@ Resume restores a round boundary, not a live shell process. It uses:
 - agent continuation state from `agent/session_snapshots/` or `agent/runtime_snapshots/`
 - copied historical verifier results for rounds before the resume point
 
-Before mutating the target trial directory, CLI preflight checks the source state according to `multiround_resume_preflight_policy`. The source trial is then backed up under `__resumed_<timestamp>/`, and artifacts from the resume point onward are cleaned before continuing in place.
+Before mutating a target trial directory, CLI preflight checks the source state according to `multiround_resume_preflight_policy`.
+
+Resume output modes:
+
+- default in-place resume backs up the source trial under `__resumed_<timestamp>/`, cleans artifacts from the resume point onward, and continues in the original trial directory
+- `--output-jobs-dir` writes a new job from the source trial without mutating the source trial
+- `--no-resume-backup` keeps the in-place write behavior but skips the automatic backup
 
 ## Roundwise Fanout
 

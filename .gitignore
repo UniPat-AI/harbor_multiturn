@@ -207,7 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 
-jobs/
+/jobs/
 harbor_jobs/
 trials/
 *.ipynb
@@ -219,7 +219,7 @@ ignore/
 !src/harbor/tasks/
 tmp/
 .DS_Store
-.mcp.json
+/.mcp.json
 /parity-experiments/
 ./dataset
 

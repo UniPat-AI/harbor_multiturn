@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from harbor.models.task.paths import TaskPaths
 from harbor.models.task.task import Task
 
@@ -104,3 +108,69 @@ change_types = ["extension"]
     assert TaskPaths(task_dir).is_valid() is True
     assert Task(task_dir).is_multiround is True
     assert Task(task_dir).num_rounds == 1
+
+
+def test_task_appends_extra_instruction_files_from_process_cwd_without_stripping(
+    tmp_path, monkeypatch
+):
+    task_dir = tmp_path / "my-task"
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "environment" / "Dockerfile").write_text("FROM alpine:3.19\n")
+    (task_dir / "tests").mkdir()
+    (task_dir / "tests" / "test.sh").write_text("#!/usr/bin/env sh\nexit 0\n")
+    (task_dir / "task.toml").write_text('version = "1.0"\n')
+    (task_dir / "instruction.md").write_text("Base instruction.\n")
+    extra_hint = tmp_path / "extra-no-multimodal-hint.md"
+    extra_hint.write_text("\nExtra hint.\n\n")
+    monkeypatch.chdir(tmp_path)
+
+    task = Task(
+        task_dir=task_dir,
+        extra_instruction_paths=[Path("extra-no-multimodal-hint.md")],
+    )
+
+    assert task.instruction == "Base instruction.\n\n\n\nExtra hint.\n\n"
+
+
+def test_task_errors_on_missing_extra_instruction_file() -> None:
+    with pytest.raises(FileNotFoundError, match="Extra instruction file not found"):
+        Task(
+            task_dir=Path("examples/tasks/hello-user"),
+            extra_instruction_paths=[Path("./extra-no-multimodal-hint.md")],
+        )
+
+
+def test_multiround_round_instruction_appends_extra_instruction(tmp_path, monkeypatch):
+    task_dir = tmp_path / "multi-task-with-extra"
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "instruction.md").write_text("Task\n")
+    (task_dir / "task.toml").write_text(
+        """
+version = "1.0"
+
+[metadata.multiround]
+num_rounds = 1
+
+[[metadata.multiround.rounds]]
+round = 1
+change_types = ["extension"]
+""".strip()
+    )
+
+    round_dir = task_dir / "round_1"
+    (round_dir / "solution").mkdir(parents=True)
+    (round_dir / "tests").mkdir(parents=True)
+    (round_dir / "instruction.md").write_text("Round instruction.\n")
+    (round_dir / "solution" / "solve.sh").write_text("#!/usr/bin/env sh\n")
+    (round_dir / "tests" / "test.sh").write_text("#!/usr/bin/env sh\n")
+
+    extra_hint = tmp_path / "extra-round-hint.md"
+    extra_hint.write_text("Extra round hint.\n")
+    monkeypatch.chdir(tmp_path)
+
+    task = Task(
+        task_dir=task_dir,
+        extra_instruction_paths=[Path("extra-round-hint.md")],
+    )
+
+    assert task.round_instruction(1) == "Round instruction.\n\n\nExtra round hint.\n"

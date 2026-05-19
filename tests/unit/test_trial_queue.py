@@ -1,15 +1,16 @@
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
 from harbor.models.job.config import RetryConfig
 from harbor.models.trial.config import TaskConfig, TrialConfig
-from harbor.models.trial.result import AgentInfo, TrialResult
+from harbor.models.trial.result import AgentInfo, ExceptionInfo, TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
-from harbor.trial.queue import TrialQueue
+from harbor.trial.queue import LiveTrialExecution, TrialQueue
 
 
 @pytest.fixture
@@ -130,6 +131,69 @@ class TestTrialQueue:
             results = [t.result() for t in tasks]
             assert len(results) == 3
             assert all(result == trial_result for result in results)
+
+    @pytest.mark.unit
+    async def test_submit_live_batch_returns_trial_handles(
+        self, queue, trial_config, trial_result
+    ):
+        """Test submitting live trials for post-run environment actions."""
+        live_execution = LiveTrialExecution(trial=MagicMock(), result=trial_result)
+
+        with patch.object(
+            queue,
+            "_execute_trial_with_retries",
+            return_value=live_execution,
+        ) as execute:
+            results = await asyncio.gather(
+                *queue.submit_live_batch(
+                    [trial_config],
+                    keep_environment_alive_on_success=True,
+                    defer_multiround_state_snapshot=True,
+                )
+            )
+
+        assert results == [live_execution]
+        execute.assert_called_once_with(
+            trial_config,
+            keep_environment_alive_on_success=True,
+            defer_multiround_state_snapshot=True,
+            return_live_trial=True,
+        )
+
+    @pytest.mark.unit
+    async def test_submit_live_batch_returns_failed_trial_results(
+        self, queue, trial_config, trial_result
+    ):
+        """Live batches keep sibling failures as results for round selection."""
+        failed_result = trial_result.model_copy(
+            update={
+                "exception_info": ExceptionInfo(
+                    exception_type="AgentTimeoutError",
+                    exception_message="timed out",
+                    exception_traceback="traceback",
+                    occurred_at=datetime(2026, 5, 20, tzinfo=timezone.utc),
+                )
+            }
+        )
+        fake_trial = MagicMock()
+        fake_trial.run = AsyncMock(return_value=failed_result)
+        fake_trial.add_hook = MagicMock()
+
+        with patch("harbor.trial.trial.Trial.create", return_value=fake_trial):
+            results = await asyncio.gather(
+                *queue.submit_live_batch(
+                    [trial_config],
+                    keep_environment_alive_on_success=True,
+                    defer_multiround_state_snapshot=True,
+                )
+            )
+
+        assert len(results) == 1
+        assert results[0] == LiveTrialExecution(trial=fake_trial, result=failed_result)
+        fake_trial.run.assert_awaited_once_with(
+            keep_environment_alive_on_success=True,
+            defer_multiround_state_snapshot=True,
+        )
 
     @pytest.mark.unit
     async def test_cancellation_via_task_group(self, queue, trial_config):

@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 from collections.abc import Coroutine
+from dataclasses import dataclass
 from typing import Any
 
 from harbor.models.job.config import RetryConfig
@@ -8,6 +9,12 @@ from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import HookCallback, TrialEvent
 from harbor.utils.logger import logger
+
+
+@dataclass(frozen=True)
+class LiveTrialExecution:
+    trial: Any
+    result: TrialResult
 
 
 class TrialQueue:
@@ -103,17 +110,27 @@ class TrialQueue:
                 trial.add_hook(event, hook)
 
     async def _execute_trial_with_retries(
-        self, trial_config: TrialConfig
-    ) -> TrialResult:
+        self,
+        trial_config: TrialConfig,
+        *,
+        keep_environment_alive_on_success: bool = False,
+        defer_multiround_state_snapshot: bool = False,
+        return_live_trial: bool = False,
+    ) -> TrialResult | LiveTrialExecution:
         """Execute a trial with retry logic."""
         from harbor.trial.trial import Trial
 
         for attempt in range(self._retry_config.max_retries + 1):
             trial = await Trial.create(trial_config)
             self._setup_hooks(trial)
-            result = await trial.run()
+            result = await trial.run(
+                keep_environment_alive_on_success=keep_environment_alive_on_success,
+                defer_multiround_state_snapshot=defer_multiround_state_snapshot,
+            )
 
             if result.exception_info is None:
+                if return_live_trial:
+                    return LiveTrialExecution(trial=trial, result=result)
                 return result
 
             if not self._should_retry_exception(result.exception_info.exception_type):
@@ -122,14 +139,19 @@ class TrialQueue:
                     "include_exceptions or the maximum number of retries has been "
                     "reached"
                 )
+                if return_live_trial:
+                    return LiveTrialExecution(trial=trial, result=result)
                 return result
             if attempt == self._retry_config.max_retries:
                 self._logger.debug(
                     "Not retrying trial because the maximum number of retries has been "
                     "reached"
                 )
+                if return_live_trial:
+                    return LiveTrialExecution(trial=trial, result=result)
                 return result
 
+            await trial.stop_agent_environment()
             shutil.rmtree(trial.paths.trial_dir, ignore_errors=True)
 
             delay_sec = self._calculate_backoff_delay_sec(attempt)
@@ -150,7 +172,29 @@ class TrialQueue:
     async def _run_trial(self, trial_config: TrialConfig) -> TrialResult:
         """Execute a single trial, acquiring the semaphore for concurrency control."""
         async with self._semaphore:
-            return await self._execute_trial_with_retries(trial_config)
+            result = await self._execute_trial_with_retries(trial_config)
+            if isinstance(result, LiveTrialExecution):
+                return result.result
+            return result
+
+    async def _run_live_trial(
+        self,
+        trial_config: TrialConfig,
+        *,
+        keep_environment_alive_on_success: bool,
+        defer_multiround_state_snapshot: bool,
+    ) -> LiveTrialExecution:
+        """Execute one trial and return its live Trial object with the result."""
+        async with self._semaphore:
+            result = await self._execute_trial_with_retries(
+                trial_config,
+                keep_environment_alive_on_success=keep_environment_alive_on_success,
+                defer_multiround_state_snapshot=defer_multiround_state_snapshot,
+                return_live_trial=True,
+            )
+            if not isinstance(result, LiveTrialExecution):
+                raise RuntimeError("Live trial execution did not return a trial handle")
+            return result
 
     def submit(self, trial_config: TrialConfig) -> Coroutine[Any, Any, TrialResult]:
         """
@@ -167,3 +211,23 @@ class TrialQueue:
         Return coroutines for multiple trials, ordered to match `configs`.
         """
         return [self.submit(config) for config in configs]
+
+    def submit_live_batch(
+        self,
+        configs: list[TrialConfig],
+        *,
+        keep_environment_alive_on_success: bool,
+        defer_multiround_state_snapshot: bool,
+    ) -> list[Coroutine[Any, Any, LiveTrialExecution]]:
+        """
+        Return coroutines that keep successful trial environments available to
+        the caller for post-run actions such as selected-only snapshots.
+        """
+        return [
+            self._run_live_trial(
+                config,
+                keep_environment_alive_on_success=keep_environment_alive_on_success,
+                defer_multiround_state_snapshot=defer_multiround_state_snapshot,
+            )
+            for config in configs
+        ]

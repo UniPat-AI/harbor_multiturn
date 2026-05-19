@@ -45,7 +45,8 @@ bash tests/run_multiturn_maintenance.sh --daytona-preflight --unit-only
 
 `--cleanup` forwards cleanup to the black-box harness so per-case job directories are removed after each case.
 `--daytona-preflight` validates local Daytona variables without printing
-`DAYTONA_API_KEY`; it does not contact Daytona or launch a sandbox.
+`DAYTONA_API_KEY`; it also checks Python/aiohttp HTTPS connectivity to the
+Daytona API health endpoint. It does not launch a sandbox.
 
 ## Unit Coverage
 
@@ -56,6 +57,7 @@ harbor/tests/unit/multiround/
 harbor/tests/unit/cli/
 harbor/tests/unit/test_task_relative_path.py
 harbor/tests/unit/models/test_job_lock.py
+harbor/tests/unit/environments/test_daytona.py
 harbor/tests/unit/environments/test_docker.py
 harbor/tests/unit/agents/installed/test_claude_code_resume_context.py
 harbor/tests/unit/agents/installed/test_setup_retry.py
@@ -88,7 +90,9 @@ uv run python -m pytest tests/unit
 - CLI parameter validation
 - reward aggregation
 - `-k 1` and `-k 4` roundwise control flow
-- selected-parent snapshot retention and unselected frontier snapshot pruning
+- selected-only snapshot capture under the default `success` policy
+- default `latest` snapshot retention, selected-chain retention, and unselected
+  frontier snapshot pruning for eager/debug paths
 - generated `mleval` MT@4: `-k 4`, one successful parent continued per round
 - generated `mleval` SR: `--start-round N --max-round N` for rounds 1, 2, and 3
 
@@ -123,9 +127,23 @@ export DAYTONA_TARGET=us
 bash tests/check_daytona_multiturn_env.sh
 ```
 
-Daytona currently validates fresh-run plumbing. Do not treat it as equivalent
-to Docker for resume / roundwise snapshot coverage until `DaytonaEnvironment`
-implements Harbor's per-round `capture_state_snapshot()` contract.
+Daytona Direct validates the same multiturn state contract as local Docker.
+Default `multiround_state_mode=auto` resolves to `pause_fork`; pass
+`multiround_state_mode=snapshot` to test Daytona snapshot materialization.
+If Daytona fork or sandbox snapshot endpoints are unavailable, both routes
+fall back to local rootfs archive restore. Pass `multiround_state_mode=archive`
+to test that path directly. DinD/Compose-backed Daytona environments are not
+used for multiturn state coverage.
+
+For Daytona Direct state-mode smoke tests, add the mode to `HARBOR_ENV_KWARGS`:
+
+```bash
+export HARBOR_ENV_KWARGS=network_block_all=false,auto_stop_interval_mins=120,auto_delete_interval_mins=240,multiround_state_mode=pause_fork
+# or
+export HARBOR_ENV_KWARGS=network_block_all=false,auto_stop_interval_mins=120,auto_delete_interval_mins=240,multiround_state_mode=snapshot
+# or
+export HARBOR_ENV_KWARGS=network_block_all=false,auto_stop_interval_mins=120,auto_delete_interval_mins=240,multiround_state_mode=archive
+```
 
 MT@4:
 

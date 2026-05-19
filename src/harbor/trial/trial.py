@@ -96,6 +96,8 @@ class Trial(ABC):
 
         self._are_agent_logs_downloaded = False
         self._is_agent_environment_stopped = False
+        self._keep_environment_alive_on_success = False
+        self._defer_multiround_state_snapshot = False
         self._result: TrialResult | None = None
         self._log_handler: logging.Handler | None = None
 
@@ -178,7 +180,14 @@ class Trial(ABC):
         for hook in self._hooks[event]:
             await hook(hook_event)
 
-    async def run(self) -> TrialResult:
+    async def run(
+        self,
+        *,
+        keep_environment_alive_on_success: bool = False,
+        defer_multiround_state_snapshot: bool = False,
+    ) -> TrialResult:
+        self._keep_environment_alive_on_success = keep_environment_alive_on_success
+        self._defer_multiround_state_snapshot = defer_multiround_state_snapshot
         self._init_result()
         await self._emit(TrialEvent.START)
 
@@ -197,9 +206,27 @@ class Trial(ABC):
             await self._recover_outputs()
         finally:
             await self._finalize()
-            self._close_logger_handler()
+            if not (
+                self._keep_environment_alive_on_success
+                and self.result.exception_info is None
+            ):
+                self._close_logger_handler()
 
         return self.result
+
+    async def stop_agent_environment(self) -> None:
+        await self._stop_agent_environment(force=True)
+        self._close_logger_handler()
+
+    async def capture_multiround_state_snapshot(
+        self,
+        *,
+        round_num: int,
+        restart_environment: bool = True,
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support multi-round state snapshots"
+        )
 
     @abstractmethod
     async def _run(self) -> None:
@@ -475,8 +502,10 @@ class Trial(ABC):
             )
             return image_ref, archive_path, snapshot_id
 
-        image_ref = image_ref or snapshot_meta.get("image_tag") or snapshot_meta.get(
-            "image_ref"
+        image_ref = (
+            image_ref
+            or snapshot_meta.get("image_tag")
+            or snapshot_meta.get("image_ref")
         )
         archive_path = archive_path or snapshot_meta.get("archive_path")
         snapshot_id = snapshot_id or snapshot_meta.get("snapshot_id")
@@ -980,8 +1009,14 @@ class Trial(ABC):
         finally:
             self.result.agent_setup.finished_at = self._now()
 
-    async def _stop_agent_environment(self) -> None:
+    async def _stop_agent_environment(self, *, force: bool = False) -> None:
         if self._is_agent_environment_stopped:
+            return
+        if (
+            not force
+            and getattr(self, "_keep_environment_alive_on_success", False)
+            and self.result.exception_info is None
+        ):
             return
 
         try:

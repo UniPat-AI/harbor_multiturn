@@ -6,7 +6,6 @@ import os
 import shlex
 import shutil
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -325,11 +324,12 @@ class SingleStepTrial(Trial):
                     )
 
             if round_status is not None:
-                await self._capture_environment_state_snapshot(
-                    round_num=round_num,
-                    round_reward=round_reward,
-                    round_status=round_status,
-                )
+                if not getattr(self, "_defer_multiround_state_snapshot", False):
+                    await self._capture_environment_state_snapshot(
+                        round_num=round_num,
+                        round_reward=round_reward,
+                        round_status=round_status,
+                    )
 
             if should_stop:
                 break
@@ -1158,6 +1158,50 @@ class SingleStepTrial(Trial):
         round_results_path = self.paths.verifier_dir / "multiround_results.json"
         round_results_path.write_text(json.dumps(round_results, indent=2))
 
+    def _round_result_for_state_snapshot(
+        self, round_num: int
+    ) -> tuple[float | int | None, str]:
+        round_results_path = self.paths.verifier_dir / "multiround_results.json"
+        if round_results_path.exists():
+            try:
+                round_results = json.loads(round_results_path.read_text())
+            except json.JSONDecodeError:
+                round_results = []
+            if isinstance(round_results, list):
+                for round_result in round_results:
+                    if (
+                        isinstance(round_result, dict)
+                        and round_result.get("round") == round_num
+                    ):
+                        status = round_result.get("status")
+                        return (
+                            round_result.get("reward"),
+                            status if isinstance(status, str) else "unknown",
+                        )
+
+        round_reward = None
+        if (
+            self.result.verifier_result is not None
+            and self.result.verifier_result.rewards is not None
+        ):
+            round_reward = self.result.verifier_result.rewards.get(f"round_{round_num}")
+        return round_reward, "completed"
+
+    async def capture_multiround_state_snapshot(
+        self,
+        *,
+        round_num: int,
+        restart_environment: bool = True,
+    ) -> None:
+        round_reward, round_status = self._round_result_for_state_snapshot(round_num)
+        await self._capture_environment_state_snapshot(
+            round_num=round_num,
+            round_reward=round_reward,
+            round_status=round_status,
+            restart_environment=restart_environment,
+        )
+        self.paths.result_path.write_text(self.result.model_dump_json(indent=4))
+
     def _should_capture_state_snapshot(
         self,
         *,
@@ -1182,22 +1226,23 @@ class SingleStepTrial(Trial):
 
     def _write_latest_state_snapshot_alias(
         self, round_num: int, snapshot_payload: dict[str, Any]
-    ) -> None:
+    ) -> str | None:
         latest_snapshot_path = self.paths.state_snapshot_path
         latest_archive_path = self.paths.state_image_archive_path
         round_archive_path = self.paths.round_state_image_archive_path(round_num)
 
         latest_payload = dict(snapshot_payload)
-        latest_payload["archive_path"] = str(
-            latest_archive_path.expanduser().absolute()
-        )
+        latest_archive_ref = snapshot_payload.get("archive_path")
+        if round_archive_path.exists():
+            latest_archive_ref = str(latest_archive_path.expanduser().absolute())
+        latest_payload["archive_path"] = latest_archive_ref
         latest_snapshot_path.write_text(json.dumps(latest_payload, indent=2))
 
         if latest_archive_path.exists() or latest_archive_path.is_symlink():
             latest_archive_path.unlink()
 
         if not round_archive_path.exists():
-            return
+            return latest_archive_ref
 
         try:
             latest_archive_path.symlink_to(
@@ -1205,6 +1250,7 @@ class SingleStepTrial(Trial):
             )
         except OSError:
             shutil.copy2(round_archive_path, latest_archive_path)
+        return latest_archive_ref
 
     async def _capture_environment_state_snapshot(
         self,
@@ -1212,6 +1258,7 @@ class SingleStepTrial(Trial):
         round_num: int,
         round_reward: float | int | None,
         round_status: str,
+        restart_environment: bool = True,
     ) -> None:
         if not self._should_capture_state_snapshot(
             round_reward=round_reward,
@@ -1225,10 +1272,11 @@ class SingleStepTrial(Trial):
         trial_name = self._trial_name()
         snapshot_id = f"{trial_name}__round-{round_num}__state"
         await self._capture_terminus_runtime_snapshot(round_num)
+        await self._capture_claude_session_snapshot(round_num)
         snapshot_data = await self.agent_environment.capture_state_snapshot(
             snapshot_id=snapshot_id,
             archive_path=self.paths.round_state_image_archive_path(round_num),
-            restart_container=True,
+            restart_container=restart_environment,
         )
 
         if snapshot_data is None:
@@ -1250,18 +1298,28 @@ class SingleStepTrial(Trial):
             "status": round_status,
             "created_at": self._now().isoformat(),
         }
+        for key in (
+            "provider",
+            "provider_state_mode",
+            "daytona_sandbox_id",
+            "daytona_sandbox_name",
+            "daytona_snapshot_name",
+        ):
+            if key in snapshot_data:
+                snapshot_payload[key] = snapshot_data.get(key)
         self.paths.round_state_snapshot_path(round_num).write_text(
             json.dumps(snapshot_payload, indent=2)
         )
-        self._write_latest_state_snapshot_alias(round_num, snapshot_payload)
-        await self._capture_claude_session_snapshot(round_num)
+        latest_archive_ref = self._write_latest_state_snapshot_alias(
+            round_num, snapshot_payload
+        )
         self._latest_snapshot_parent_id = snapshot_payload.get("snapshot_id")
 
         self.result.environment_state = EnvironmentStateInfo(
             snapshot_id=snapshot_payload.get("snapshot_id"),
             image_ref=snapshot_payload.get("image_tag")
             or snapshot_payload.get("image_ref"),
-            image_archive=str(self.paths.state_image_archive_path.absolute()),
+            image_archive=latest_archive_ref,
             parent_snapshot_id=snapshot_payload.get("parent_snapshot_id"),
             source=snapshot_payload.get("source_trial"),
         )

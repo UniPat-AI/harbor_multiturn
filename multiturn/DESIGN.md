@@ -42,7 +42,9 @@ Inside the window, each round follows the same sequence:
 2. Call `agent.run_round(...)`.
 3. Run the round verifier from `round_N/tests/`.
 4. Archive round-specific verifier artifacts.
-5. Capture snapshot and agent continuation state if policy allows.
+5. Capture snapshot and agent continuation state if policy allows. In roundwise
+   fresh runs with the default `success` policy, this capture is deferred until
+   Job selects the successful parent for that round.
 
 After the window, future rounds are not executed and do not produce round artifacts.
 
@@ -86,7 +88,12 @@ selected parent:
 - successful parents are selected according to `multiround_continue_successes_per_round`
 - child trials start at the next round from the selected parent snapshot
 - child names include the parent attempt and lineage token
-- snapshot state for unselected frontier trials is pruned after parent selection
+- default `success` mode captures snapshots only for selected successful parents,
+  including the final round
+- default `latest` retention keeps only the latest selected round snapshot and
+  prunes older selected snapshots after a newer one is available
+- `selected` retention keeps the selected parent chain; `all` mode keeps eager
+  snapshot capture for debugging and extra restore points
 
 The scheduler waits for the full current frontier before selecting parents. It does not cancel sibling attempts after the first success.
 

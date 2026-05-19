@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,7 @@ from harbor.models.trial.result import TrialResult
 from harbor.registry.client import RegistryClientFactory
 from harbor.tasks.client import TaskClient, TaskDownloadResult, TaskIdType
 from harbor.trial.hooks import HookCallback, TrialEvent, TrialHookEvent
-from harbor.trial.queue import TrialQueue
+from harbor.trial.queue import LiveTrialExecution, TrialQueue
 from harbor.utils.logger import HarborConsoleFormatter, logger
 from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
 
@@ -350,7 +351,9 @@ class Job:
                 if AgentFactory.supports_multiround_from_config(agent_config):
                     continue
 
-                agent_label = agent_config.import_path or agent_config.name or "<unknown>"
+                agent_label = (
+                    agent_config.import_path or agent_config.name or "<unknown>"
+                )
                 raise ValueError(
                     "Multi-round tasks require an agent with explicit run_round() "
                     f"support. Agent '{agent_label}' is not supported for multi-round "
@@ -740,9 +743,7 @@ class Job:
         config.verifier.multiround_resume_trial_name = None
         config.verifier.multiround_resume_state_image = resume_state_image
         config.verifier.multiround_resume_state_archive = resume_state_archive
-        config.verifier.multiround_resume_state_snapshot_id = (
-            resume_state_snapshot_id
-        )
+        config.verifier.multiround_resume_state_snapshot_id = resume_state_snapshot_id
         config.trial_name = config.generate_trial_name()
         return config
 
@@ -789,9 +790,7 @@ class Job:
                 round_num=start_round,
                 resume_source=resume_source,
             )
-            root_config.trial_name = (
-                f"{root_config.trial_name}__mr-r{start_round}-{parent_segment}-a{attempt_idx}"
-            )
+            root_config.trial_name = f"{root_config.trial_name}__mr-r{start_round}-{parent_segment}-a{attempt_idx}"
             frontier.append(root_config)
 
         return frontier
@@ -829,7 +828,10 @@ class Job:
     def _is_successful_round_result(trial_result: TrialResult, round_num: int) -> bool:
         if trial_result.exception_info is not None:
             return False
-        if trial_result.verifier_result is None or trial_result.verifier_result.rewards is None:
+        if (
+            trial_result.verifier_result is None
+            or trial_result.verifier_result.rewards is None
+        ):
             return False
 
         round_reward = trial_result.verifier_result.rewards.get(f"round_{round_num}")
@@ -858,8 +860,10 @@ class Job:
         if snapshot_meta_path.exists():
             try:
                 snapshot_meta = json.loads(snapshot_meta_path.read_text())
-                image_ref = image_ref or snapshot_meta.get("image_tag") or snapshot_meta.get(
-                    "image_ref"
+                image_ref = (
+                    image_ref
+                    or snapshot_meta.get("image_tag")
+                    or snapshot_meta.get("image_ref")
                 )
                 archive_path = archive_path or snapshot_meta.get("archive_path")
                 snapshot_id = snapshot_id or snapshot_meta.get("snapshot_id")
@@ -876,13 +880,134 @@ class Job:
         )
         return image_ref, archive_path, snapshot_id
 
-    def _prune_trial_snapshot_state(self, trial_result: TrialResult) -> None:
+    @staticmethod
+    def _snapshot_image_tags_for_cleanup(state_dir: Path) -> set[str]:
+        image_tags: set[str] = set()
+        if not state_dir.exists() or not state_dir.is_dir():
+            return image_tags
+
+        snapshot_paths = [state_dir / "snapshot.json"]
+        snapshot_paths.extend(state_dir.glob("round_*/snapshot.json"))
+        for snapshot_path in snapshot_paths:
+            if not snapshot_path.exists():
+                continue
+            try:
+                snapshot_meta = json.loads(snapshot_path.read_text())
+            except Exception:
+                continue
+            image_tag = snapshot_meta.get("image_tag")
+            if isinstance(image_tag, str) and image_tag.startswith("hbstate__"):
+                image_tags.add(image_tag)
+
+        return image_tags
+
+    @staticmethod
+    def _daytona_state_refs_for_cleanup(state_dir: Path) -> tuple[set[str], set[str]]:
+        sandbox_refs: set[str] = set()
+        snapshot_refs: set[str] = set()
+        if not state_dir.exists() or not state_dir.is_dir():
+            return sandbox_refs, snapshot_refs
+
+        snapshot_paths = [state_dir / "snapshot.json"]
+        snapshot_paths.extend(state_dir.glob("round_*/snapshot.json"))
+        for snapshot_path in snapshot_paths:
+            if not snapshot_path.exists():
+                continue
+            try:
+                snapshot_meta = json.loads(snapshot_path.read_text())
+            except Exception:
+                continue
+            if snapshot_meta.get("provider") != "daytona":
+                continue
+
+            sandbox_id = snapshot_meta.get("daytona_sandbox_id")
+            if isinstance(sandbox_id, str) and sandbox_id:
+                sandbox_refs.add(sandbox_id)
+
+            snapshot_name = snapshot_meta.get("daytona_snapshot_name")
+            if isinstance(snapshot_name, str) and snapshot_name:
+                snapshot_refs.add(snapshot_name)
+
+            image_ref = snapshot_meta.get("image_tag") or snapshot_meta.get(
+                "image_ref"
+            )
+            if isinstance(image_ref, str):
+                if image_ref.startswith("daytona-fork-source:"):
+                    sandbox_refs.add(image_ref.removeprefix("daytona-fork-source:"))
+                elif image_ref.startswith("daytona-snapshot:"):
+                    snapshot_refs.add(image_ref.removeprefix("daytona-snapshot:"))
+
+        return sandbox_refs, snapshot_refs
+
+    def _delete_snapshot_image_tags(self, image_tags: set[str]) -> None:
+        if not image_tags or not shutil.which("docker"):
+            return
+
+        for image_tag in sorted(image_tags):
+            try:
+                result = subprocess.run(
+                    ["docker", "image", "rm", image_tag],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception as e:
+                self._logger.debug(
+                    "[multiround] failed deleting snapshot image tag %s: %s",
+                    image_tag,
+                    e,
+                )
+                continue
+
+            if result.returncode not in (0, 1):
+                self._logger.debug(
+                    "[multiround] docker image rm %s exited %s: %s%s",
+                    image_tag,
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                )
+
+    async def _delete_daytona_state_refs(
+        self,
+        *,
+        sandbox_refs: set[str],
+        snapshot_refs: set[str],
+    ) -> None:
+        if not sandbox_refs and not snapshot_refs:
+            return
+
+        try:
+            from harbor.environments.daytona import DaytonaStateCleanup
+        except Exception as exc:
+            self._logger.warning(
+                "[multiround] cannot import Daytona cleanup helper: %s",
+                exc,
+            )
+            return
+
+        for sandbox_ref in sorted(sandbox_refs):
+            await DaytonaStateCleanup.delete_sandbox(sandbox_ref, self._logger)
+        for snapshot_ref in sorted(snapshot_refs):
+            await DaytonaStateCleanup.delete_snapshot(snapshot_ref, self._logger)
+
+    async def _prune_trial_snapshot_state(self, trial_result: TrialResult) -> None:
         """Remove on-disk snapshot state for a trial that will not continue."""
         trial_dir = self._trial_dir_from_result(trial_result)
         trial_paths = TrialPaths(trial_dir)
+        image_tags = self._snapshot_image_tags_for_cleanup(trial_paths.state_dir)
+        daytona_sandbox_refs, daytona_snapshot_refs = (
+            self._daytona_state_refs_for_cleanup(trial_paths.state_dir)
+        )
 
         if trial_paths.state_dir.exists() or trial_paths.state_dir.is_symlink():
             shutil.rmtree(trial_paths.state_dir, ignore_errors=True)
+        self._delete_snapshot_image_tags(image_tags)
+        await self._delete_daytona_state_refs(
+            sandbox_refs=daytona_sandbox_refs,
+            snapshot_refs=daytona_snapshot_refs,
+        )
 
         if trial_result.environment_state is not None:
             trial_result.environment_state.image_archive = None
@@ -890,7 +1015,7 @@ class Job:
         if trial_paths.result_path.exists():
             trial_paths.result_path.write_text(trial_result.model_dump_json(indent=4))
 
-    def _prune_round_snapshot_retention(
+    async def _prune_round_snapshot_retention(
         self,
         *,
         round_num: int,
@@ -898,16 +1023,46 @@ class Job:
         kept_results: list[TrialResult],
     ) -> None:
         """Keep snapshot state only for the selected parents of a round."""
+        if self.config.verifier.multiround_state_retention_policy == "all":
+            return
+
         kept_trial_names = {result.trial_name for result in kept_results}
 
         for result in round_results:
             if result.trial_name in kept_trial_names:
                 continue
             try:
-                self._prune_trial_snapshot_state(result)
+                await self._prune_trial_snapshot_state(result)
             except Exception as e:
                 self._logger.warning(
                     "[multiround] failed pruning snapshot state for round %s trial %s: %s",
+                    round_num,
+                    result.trial_name,
+                    e,
+                )
+
+    async def _prune_previous_round_snapshot_retention(
+        self,
+        *,
+        round_num: int,
+        previous_results: list[TrialResult],
+        current_results: list[TrialResult],
+    ) -> None:
+        if self.config.verifier.multiround_state_retention_policy != "latest":
+            return
+        if not current_results:
+            return
+
+        current_trial_names = {result.trial_name for result in current_results}
+        for result in previous_results:
+            if result.trial_name in current_trial_names:
+                continue
+            try:
+                await self._prune_trial_snapshot_state(result)
+            except Exception as e:
+                self._logger.warning(
+                    "[multiround] failed pruning previous snapshot state before "
+                    "round %s trial %s: %s",
                     round_num,
                     result.trial_name,
                     e,
@@ -919,7 +1074,9 @@ class Job:
         *,
         max_selected: int,
     ) -> list[TrialResult]:
-        ordered_results = sorted(successful_results, key=lambda result: result.trial_name)
+        ordered_results = sorted(
+            successful_results, key=lambda result: result.trial_name
+        )
         return ordered_results[:max_selected]
 
     async def _run_trial_batch(
@@ -931,6 +1088,53 @@ class Job:
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(coro) for coro in coros]
         return [task.result() for task in tasks]
+
+    async def _run_live_trial_batch(
+        self,
+        trial_configs: list[TrialConfig],
+        *,
+        keep_environment_alive_on_success: bool,
+        defer_multiround_state_snapshot: bool,
+    ) -> list[LiveTrialExecution]:
+        if not trial_configs:
+            return []
+        coros = self._trial_queue.submit_live_batch(
+            trial_configs,
+            keep_environment_alive_on_success=keep_environment_alive_on_success,
+            defer_multiround_state_snapshot=defer_multiround_state_snapshot,
+        )
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(coro) for coro in coros]
+        return [task.result() for task in tasks]
+
+    async def _stop_live_trial_environments(
+        self, live_executions: list[LiveTrialExecution]
+    ) -> None:
+        async with asyncio.TaskGroup() as tg:
+            for execution in live_executions:
+                tg.create_task(execution.trial.stop_agent_environment())
+
+    async def _capture_selected_parent_snapshots(
+        self,
+        *,
+        round_num: int,
+        retained_results: list[TrialResult],
+        live_executions: list[LiveTrialExecution],
+    ) -> None:
+        live_by_trial_name = {
+            execution.result.trial_name: execution for execution in live_executions
+        }
+        for result in retained_results:
+            execution = live_by_trial_name.get(result.trial_name)
+            if execution is None:
+                raise RuntimeError(
+                    "Selected parent has no live trial handle for snapshot capture: "
+                    f"{result.trial_name}"
+                )
+            await execution.trial.capture_multiround_state_snapshot(
+                round_num=round_num,
+                restart_environment=False,
+            )
 
     async def _run_roundwise_multiround_attempt_selection(self) -> list[TrialResult]:
         """Run multi-round attempts with per-round successful trajectory selection."""
@@ -949,6 +1153,9 @@ class Job:
             start_round = seed_config.verifier.multiround_start_round or 1
             max_round = seed_config.verifier.multiround_max_round or task.num_rounds
             end_round = min(max_round, task.num_rounds)
+            defer_roundwise_snapshots = (
+                self.config.verifier.multiround_state_cache_policy == "success"
+            )
 
             self._logger.info(
                 "\n[multiround] enabled | task=%s | agent=%s | model=%s "
@@ -966,6 +1173,7 @@ class Job:
                 group=group,
                 start_round=start_round,
             )
+            previous_retained_results: list[TrialResult] = []
 
             for round_num in range(start_round, end_round + 1):
                 if not frontier:
@@ -981,24 +1189,51 @@ class Job:
                     end_round,
                     len(frontier),
                 )
-                round_results = await self._run_trial_batch(frontier)
+                live_executions: list[LiveTrialExecution] = []
+                if defer_roundwise_snapshots:
+                    live_executions = await self._run_live_trial_batch(
+                        frontier,
+                        keep_environment_alive_on_success=True,
+                        defer_multiround_state_snapshot=True,
+                    )
+                    round_results = [execution.result for execution in live_executions]
+                else:
+                    round_results = await self._run_trial_batch(frontier)
                 all_results.extend(round_results)
 
-                successful_results = [
-                    result
-                    for result in round_results
-                    if self._is_successful_round_result(result, round_num)
-                ]
-                retained_results = self._select_roundwise_parent_results(
-                    successful_results,
-                    max_selected=successes_per_round,
-                )
+                try:
+                    successful_results = [
+                        result
+                        for result in round_results
+                        if self._is_successful_round_result(result, round_num)
+                    ]
+                    retained_results = self._select_roundwise_parent_results(
+                        successful_results,
+                        max_selected=successes_per_round,
+                    )
 
-                self._prune_round_snapshot_retention(
+                    if defer_roundwise_snapshots:
+                        await self._capture_selected_parent_snapshots(
+                            round_num=round_num,
+                            retained_results=retained_results,
+                            live_executions=live_executions,
+                        )
+                finally:
+                    if live_executions:
+                        await self._stop_live_trial_environments(live_executions)
+
+                await self._prune_round_snapshot_retention(
                     round_num=round_num,
                     round_results=round_results,
                     kept_results=retained_results,
                 )
+                await self._prune_previous_round_snapshot_retention(
+                    round_num=round_num,
+                    previous_results=previous_retained_results,
+                    current_results=retained_results,
+                )
+                if retained_results:
+                    previous_retained_results = retained_results
 
                 if round_num >= end_round:
                     break
@@ -1067,9 +1302,7 @@ class Job:
                             parent_attempt_idx=parent_attempt_idx,
                             parent_trial_name=parent_result.trial_name,
                         )
-                        child_config.trial_name = (
-                            f"{child_config.trial_name}__mr-r{next_round}-{parent_segment}-a{attempt_idx}"
-                        )
+                        child_config.trial_name = f"{child_config.trial_name}__mr-r{next_round}-{parent_segment}-a{attempt_idx}"
                         next_frontier.append(child_config)
                 frontier = next_frontier
 

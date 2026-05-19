@@ -73,14 +73,32 @@ trial/state/snapshot.json
 trial/state/snapshot-image.tar
 ```
 
-`state/snapshot.*` is the latest successful alias. Resume and roundwise fanout use the concrete `round_N` snapshot as the durable restore point.
+`state/snapshot.*` is the latest saved alias. Resume and roundwise fanout use
+the concrete `round_N` snapshot as the durable restore point. In fresh
+roundwise runs with the default `success` policy, snapshots are selected-only:
+Harbor captures a snapshot only for selected successful parents, including the
+final round. The default `latest` retention policy keeps only the latest
+selected round snapshot. Use `selected` to keep the selected chain, or `all` to
+avoid retention pruning when debugging.
 
-Daytona can run Harbor tasks in remote sandboxes and can use Daytona startup
-snapshots, but the current Daytona environment does not implement Harbor's
-per-round state snapshot hook. Use Daytona for credentialed fresh-run smoke
-coverage only until a Daytona-specific per-round snapshot backend is added and
-tested. Resume and roundwise fanout still require an environment that implements
-the Harbor snapshot contract.
+Daytona Direct implements the same Harbor per-round state contract. Its default
+`multiround_state_mode=auto` resolves to `pause_fork`: Harbor saves a local
+rootfs archive for the selected sandbox at the round boundary, records the
+sandbox as the next round's fork source, deletes unselected siblings, then
+tries to fork the selected source when a child trial resumes. If the Daytona
+service does not expose sandbox fork or dynamic sandbox snapshot endpoints,
+Harbor restores the child from the local archive. `multiround_state_mode=snapshot`
+uses Daytona snapshots when available and otherwise falls back to the same
+local archive restore path. `multiround_state_mode=archive` uses only the local
+archive path.
+
+Daytona state metadata is written to the same `state/round_N/snapshot.json`
+contract. Daytona entries use provider-specific references such as
+`daytona-fork-source:<sandbox_id>`, `daytona-snapshot:<snapshot_name>`, or
+`daytona-archive:<snapshot_id>`. Archive fallback writes `snapshot-image.tar`
+and `archive_path` just like the Docker state contract. DinD/Compose-backed
+Daytona environments are not a multiturn state backend; Compose-heavy
+multiturn coverage stays on local Docker.
 
 ## Unsupported Combinations
 

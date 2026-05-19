@@ -46,6 +46,12 @@ Responsibilities:
 - Validate that multiturn tasks use agents with explicit round support.
 - Use upstream `TrialQueue` scheduling for normal jobs.
 - Switch eligible local multiturn runs into roundwise frontier/child expansion; default in-place resume stays on the single-trial writeback path.
+- Use `TrialQueue.submit_live_batch()` for default `success` roundwise runs so
+  selected parent snapshots can be captured after parent selection instead of
+  inside every successful sibling trial.
+- Apply roundwise snapshot retention after capture: default `latest` keeps only
+  the latest selected round snapshot, `selected` keeps the selected chain, and
+  `all` disables retention pruning.
 - Pass parent snapshot and lineage metadata into child trial configs.
 
 ## Trial Lifecycle
@@ -63,6 +69,7 @@ Responsibilities:
 - Keep compatibility aliases used by local multiturn helpers.
 - Branch `SingleStepTrial._run()` into the multiturn loop when `task.is_multiround`.
 - Archive per-round verifier artifacts and aggregate final results.
+- Defer environment snapshot capture when Job owns roundwise parent selection.
 - Merge same-agent resume trajectory data without deleting valid current-round repeated steps.
 
 ## Agents
@@ -90,13 +97,23 @@ Files:
 
 - `src/harbor/environments/base.py`
 - `src/harbor/environments/docker/docker.py`
+- `src/harbor/environments/daytona.py`
 
 Responsibilities:
 
 - Define the environment snapshot capability.
 - Restore Docker environments from snapshot image/archive metadata.
-- Capture per-round Docker image snapshots.
+- Capture per-round Docker image snapshots. Default roundwise `success` capture
+  is selected-only, and default `latest` retention removes older selected
+  snapshots after a newer round snapshot exists.
 - Prepare logs and writable mounts for host access during stop/download.
+- Restore Daytona Direct children from `daytona-fork-source:<sandbox_id>`,
+  `daytona-snapshot:<snapshot_name>`, or `daytona-archive:<snapshot_id>`
+  metadata. Fork/snapshot restores prefer Daytona endpoints and fall back to
+  local rootfs archives when the service does not expose those endpoints.
+- Capture Daytona Direct round state with default `pause_fork`, explicit
+  `snapshot`, or explicit `archive` semantics. DinD/Compose-backed Daytona
+  environments are rejected for multiturn state capture.
 
 ## Output Contract
 

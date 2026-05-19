@@ -158,6 +158,65 @@ async def test_capture_environment_state_snapshot_writes_round_and_latest_files(
 
 
 @pytest.mark.asyncio
+async def test_capture_environment_state_snapshot_preserves_remote_provider_archive_path(
+    tmp_path: Path,
+):
+    trial_dir = tmp_path / "trial"
+    trial_paths = TrialPaths(trial_dir=trial_dir)
+    trial_paths.mkdir()
+
+    async def fake_capture(
+        snapshot_id: str, archive_path: Path, restart_container: bool
+    ):
+        assert restart_container is False
+        assert archive_path == trial_paths.round_state_image_archive_path(1)
+        return {
+            "snapshot_id": snapshot_id,
+            "provider": "daytona",
+            "provider_state_mode": "pause_fork",
+            "image_tag": "daytona-fork-source:sandbox-1",
+            "image_ref": "daytona-fork-source:sandbox-1",
+            "archive_path": "",
+            "daytona_sandbox_id": "sandbox-1",
+        }
+
+    trial = object.__new__(SingleStepTrial)
+    trial._logger = logger.getChild("test_trial_multiround_daytona_state")
+    trial._task = SimpleNamespace(is_multiround=True)
+    trial._trial_paths = trial_paths
+    trial._environment = SimpleNamespace(
+        capture_state_snapshot=AsyncMock(side_effect=fake_capture)
+    )
+    trial._agent = SimpleNamespace(name=lambda: AgentName.ORACLE.value)
+    trial._latest_snapshot_parent_id = None
+    trial._result = SimpleNamespace(environment_state=None)
+    trial.config = SimpleNamespace(
+        trial_name="demo__abc123",
+        verifier=SimpleNamespace(
+            multiround_state_cache_policy="success",
+            multiround_resume_source=None,
+        ),
+    )
+
+    await trial._capture_environment_state_snapshot(
+        round_num=1,
+        round_reward=1.0,
+        round_status="completed",
+        restart_environment=False,
+    )
+
+    latest_payload = json.loads(trial_paths.state_snapshot_path.read_text())
+    round_payload = json.loads(trial_paths.round_state_snapshot_path(1).read_text())
+
+    assert latest_payload["provider"] == "daytona"
+    assert latest_payload["provider_state_mode"] == "pause_fork"
+    assert latest_payload["archive_path"] == ""
+    assert round_payload["daytona_sandbox_id"] == "sandbox-1"
+    assert not trial_paths.state_image_archive_path.exists()
+    assert trial.result.environment_state.image_archive == ""
+
+
+@pytest.mark.asyncio
 async def test_capture_environment_state_snapshot_also_writes_claude_session_snapshot(
     tmp_path: Path,
 ):

@@ -2,10 +2,12 @@
 
 import json
 import logging
+import os
 import shlex
 from pathlib import Path
 from typing import cast
 
+import certifi
 import pytest
 
 from harbor.environments.daytona import (
@@ -13,6 +15,9 @@ from harbor.environments.daytona import (
     DaytonaEnvironment,
     _DaytonaDinD,
     _DaytonaDirect,
+    _DAYTONA_FORK_SOURCE_PREFIX,
+    _DAYTONA_SNAPSHOT_PREFIX,
+    _ensure_daytona_ssl_cert_file,
 )
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.config import ServiceVolumeConfig
@@ -78,6 +83,95 @@ def _make_env(
     )
 
 
+class _FakeSandbox:
+    def __init__(
+        self,
+        sandbox_id: str = "sandbox-1",
+        *,
+        state: str = "stopped",
+        fork_error: Exception | None = None,
+        snapshot_error: Exception | None = None,
+    ):
+        self.id = sandbox_id
+        self.name = f"name-{sandbox_id}"
+        self.state = state
+        self.fork_error = fork_error
+        self.snapshot_error = snapshot_error
+        self.started = False
+        self.stopped: list[dict] = []
+        self.deleted = False
+        self.created_snapshots: list[tuple[str, float | None]] = []
+        self.forks: list[tuple[str | None, float | None]] = []
+
+    async def start(self, timeout=None):
+        self.started = True
+        self.state = "started"
+
+    async def stop(self, timeout=None, force=False):
+        self.stopped.append({"timeout": timeout, "force": force})
+        self.state = "stopped"
+
+    async def delete(self, timeout=None):
+        self.deleted = True
+
+    async def _experimental_create_snapshot(self, name, timeout=None):
+        if self.snapshot_error:
+            raise self.snapshot_error
+        self.created_snapshots.append((name, timeout))
+
+    async def _experimental_fork(self, name=None, timeout=None):
+        self.forks.append((name, timeout))
+        if self.fork_error:
+            raise self.fork_error
+        return _FakeSandbox("fork-1", state="started")
+
+
+class _FakeDaytonaClient:
+    def __init__(self, parent: _FakeSandbox):
+        self.parent = parent
+        self.created_params: list[object] = []
+
+    async def get(self, sandbox_id_or_name: str):
+        assert sandbox_id_or_name == self.parent.id
+        return self.parent
+
+    async def create(self, params, timeout=None):
+        self.created_params.append(params)
+        return _FakeSandbox("snapshot-child", state="started")
+
+
+class _FakeClientManager:
+    def __init__(self, client: _FakeDaytonaClient):
+        self.client = client
+        self.configure_calls: list[dict] = []
+
+    async def configure(self, **kwargs):
+        self.configure_calls.append(kwargs)
+
+    async def get_client(self):
+        return self.client
+
+
+def test_ensure_daytona_ssl_cert_file_sets_certifi_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    _ensure_daytona_ssl_cert_file()
+
+    assert os.environ["SSL_CERT_FILE"] == certifi.where()
+
+
+def test_ensure_daytona_ssl_cert_file_preserves_user_value(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SSL_CERT_FILE", "/custom/ca.pem")
+
+    _ensure_daytona_ssl_cert_file()
+
+    assert os.environ["SSL_CERT_FILE"] == "/custom/ca.pem"
+
+
 # ── Strategy selection ────────────────────────────────────────────────
 
 
@@ -115,6 +209,175 @@ class TestStrategySelection:
                 trial_paths=trial_paths,
                 task_env_config=EnvironmentConfig(),
             )
+
+
+class TestDirectMultiroundState:
+    async def test_pause_fork_capture_stops_and_retains_sandbox(
+        self, monkeypatch: pytest.MonkeyPatch, temp_dir
+    ):
+        env = _make_env(temp_dir, compose=False)
+        sandbox = _FakeSandbox("parent-1", state="started")
+        env._sandbox = sandbox
+        env._daytona_multiround_state_mode = "pause_fork"
+        archive_path = temp_dir / "state.tar.gz"
+
+        async def fake_archive(snapshot_id, archive_path_arg):
+            assert snapshot_id == "trial__round-1"
+            assert archive_path_arg == archive_path
+            return {"archive_path": str(archive_path)}
+
+        monkeypatch.setattr(env, "_capture_filesystem_archive", fake_archive)
+
+        data = await env.capture_state_snapshot(
+            "trial__round-1",
+            archive_path=archive_path,
+        )
+
+        assert data is not None
+        assert data["provider"] == "daytona"
+        assert data["provider_state_mode"] == "pause_fork"
+        assert data["image_ref"] == f"{_DAYTONA_FORK_SOURCE_PREFIX}parent-1"
+        assert data["archive_path"] == str(archive_path)
+        assert sandbox.stopped == [{"timeout": 60, "force": False}]
+        assert env._retain_sandbox_as_multiround_state is True
+
+        await env.stop(delete=True)
+
+        assert sandbox.deleted is False
+        assert env._sandbox is None
+
+    async def test_snapshot_capture_creates_daytona_snapshot(self, temp_dir):
+        env = _make_env(temp_dir, compose=False)
+        sandbox = _FakeSandbox("sandbox-1", state="started")
+        env._sandbox = sandbox
+        env._daytona_multiround_state_mode = "snapshot"
+
+        data = await env.capture_state_snapshot("trial__round-1")
+
+        assert data is not None
+        assert data["provider_state_mode"] == "snapshot"
+        assert data["image_ref"].startswith(_DAYTONA_SNAPSHOT_PREFIX)
+        assert data["daytona_snapshot_name"]
+        assert sandbox.created_snapshots == [
+            (data["daytona_snapshot_name"], 300)
+        ]
+        assert env._retain_sandbox_as_multiround_state is False
+
+    async def test_start_from_fork_source_forks_parent_and_resets_outputs(
+        self, monkeypatch: pytest.MonkeyPatch, temp_dir
+    ):
+        parent = _FakeSandbox("parent-1", state="stopped")
+        client = _FakeDaytonaClient(parent)
+        manager = _FakeClientManager(client)
+
+        async def fake_get_instance():
+            return manager
+
+        monkeypatch.setattr(DaytonaClientManager, "get_instance", fake_get_instance)
+
+        env = _make_env(temp_dir, compose=False)
+        env._resume_state_image_ref = f"{_DAYTONA_FORK_SOURCE_PREFIX}parent-1"
+        reset_calls: list[str] = []
+
+        async def fake_reset():
+            reset_calls.append("reset")
+
+        strategy = env._strategy
+        assert isinstance(strategy, _DaytonaDirect)
+        monkeypatch.setattr(strategy, "_reset_trial_output_dirs", fake_reset)
+
+        await env.start(force_build=False)
+
+        assert parent.started is True
+        assert parent.forks == [(env._daytona_state_name("hbfork", env.session_id), 120)]
+        assert parent.stopped == []
+        assert env._sandbox is not None
+        assert env._sandbox.id == "fork-1"
+        assert env.restored_from_snapshot is True
+        assert reset_calls == ["reset"]
+
+    async def test_start_from_fork_source_falls_back_to_snapshot_when_fork_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, temp_dir
+    ):
+        parent = _FakeSandbox(
+            "parent-1",
+            state="started",
+            fork_error=RuntimeError("Cannot POST /api/sandbox/parent-1/fork"),
+        )
+        client = _FakeDaytonaClient(parent)
+        manager = _FakeClientManager(client)
+
+        async def fake_get_instance():
+            return manager
+
+        monkeypatch.setattr(DaytonaClientManager, "get_instance", fake_get_instance)
+
+        env = _make_env(temp_dir, compose=False)
+        env._resume_state_image_ref = f"{_DAYTONA_FORK_SOURCE_PREFIX}parent-1"
+        reset_calls: list[str] = []
+
+        async def fake_reset():
+            reset_calls.append("reset")
+
+        strategy = env._strategy
+        assert isinstance(strategy, _DaytonaDirect)
+        monkeypatch.setattr(strategy, "_reset_trial_output_dirs", fake_reset)
+
+        await env.start(force_build=False)
+
+        assert parent.forks == [(env._daytona_state_name("hbfork", env.session_id), 120)]
+        assert parent.created_snapshots == [
+            (env._transient_resume_snapshot_names[0], 300)
+        ]
+        assert client.created_params
+        assert client.created_params[0].snapshot == env._transient_resume_snapshot_names[0]
+        assert env._sandbox is not None
+        assert env._sandbox.id == "snapshot-child"
+        assert env.restored_from_snapshot is True
+        assert reset_calls == ["reset"]
+
+    async def test_start_from_fork_source_falls_back_to_archive_when_snapshot_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, temp_dir
+    ):
+        parent = _FakeSandbox(
+            "parent-1",
+            state="started",
+            fork_error=RuntimeError("Cannot POST /api/sandbox/parent-1/fork"),
+            snapshot_error=RuntimeError("Cannot POST /api/sandbox/parent-1/snapshot"),
+        )
+        client = _FakeDaytonaClient(parent)
+        manager = _FakeClientManager(client)
+
+        async def fake_get_instance():
+            return manager
+
+        monkeypatch.setattr(DaytonaClientManager, "get_instance", fake_get_instance)
+
+        env = _make_env(temp_dir, compose=False)
+        env._resume_state_image_ref = f"{_DAYTONA_FORK_SOURCE_PREFIX}parent-1"
+        env._resume_state_archive_path = str(temp_dir / "state.tar.gz")
+        archive_calls: list[tuple[Path, bool]] = []
+
+        strategy = env._strategy
+        assert isinstance(strategy, _DaytonaDirect)
+
+        async def fake_start_from_archive(archive_path: Path, *, force_build: bool):
+            archive_calls.append((archive_path, force_build))
+
+        monkeypatch.setattr(strategy, "_start_from_archive", fake_start_from_archive)
+
+        await env.start(force_build=False)
+
+        assert parent.forks == [(env._daytona_state_name("hbfork", env.session_id), 120)]
+        assert parent.created_snapshots == []
+        assert archive_calls == [(Path(env._resume_state_archive_path), False)]
+
+    async def test_compose_mode_rejects_multiround_state_capture(self, temp_dir):
+        env = _make_env(temp_dir, compose=True)
+        env._sandbox = _FakeSandbox("sandbox-1", state="started")
+
+        with pytest.raises(RuntimeError, match="Direct Daytona"):
+            await env.capture_state_snapshot("trial__round-1")
 
 
 # ── DinD compose command building ─────────────────────────────────────

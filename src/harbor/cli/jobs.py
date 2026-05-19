@@ -1827,6 +1827,15 @@ def start(
             show_default=False,
         ),
     ] = None,
+    multiround_state_retention_policy: Annotated[
+        str | None,
+        Option(
+            "--multiround-state-retention-policy",
+            help="Roundwise snapshot retention policy: latest, selected, or all.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
     multiround_resume_preflight_policy: Annotated[
         str | None,
         Option(
@@ -2145,6 +2154,17 @@ def start(
                 "--multiround-state-cache-policy must be one of: off, success, all"
             )
         config.verifier.multiround_state_cache_policy = multiround_state_cache_policy
+
+    if multiround_state_retention_policy is not None:
+        allowed_retention_policies = {"latest", "selected", "all"}
+        if multiround_state_retention_policy not in allowed_retention_policies:
+            raise ValueError(
+                "--multiround-state-retention-policy must be one of: "
+                "latest, selected, all"
+            )
+        config.verifier.multiround_state_retention_policy = (
+            multiround_state_retention_policy
+        )
 
     if multiround_resume_preflight_policy is not None:
         allowed_preflight_policies = {"off", "snapshot", "strict"}

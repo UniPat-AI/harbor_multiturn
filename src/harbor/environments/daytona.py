@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import os
+import re
 import shlex
 import tempfile
 from abc import abstractmethod
@@ -65,6 +67,27 @@ if TYPE_CHECKING:
 _SandboxParams = Union[
     "CreateSandboxFromImageParams", "CreateSandboxFromSnapshotParams"
 ]
+_DAYTONA_FORK_SOURCE_PREFIX = "daytona-fork-source:"
+_DAYTONA_SNAPSHOT_PREFIX = "daytona-snapshot:"
+_DAYTONA_ARCHIVE_PREFIX = "daytona-archive:"
+_DAYTONA_STATE_MODES = {"auto", "pause_fork", "snapshot", "archive"}
+
+
+def _coerce_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _daytona_resource_name(prefix: str, raw: str, *, max_len: int = 62) -> str:
+    sanitized = re.sub(r"[^a-zA-Z0-9-]+", "-", raw).strip("-").lower()
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    head_len = max(1, max_len - len(prefix) - len(digest) - 2)
+    head = sanitized[:head_len].strip("-") or "state"
+    return f"{prefix}-{head}-{digest}"
 
 
 def _daytona_preflight() -> None:
@@ -79,6 +102,27 @@ def _daytona_preflight() -> None:
             "DAYTONA_JWT_TOKEN and DAYTONA_ORGANIZATION_ID, to be set. "
             "Please set the required environment variables and try again."
         )
+    _ensure_daytona_ssl_cert_file()
+
+
+def _ensure_daytona_ssl_cert_file() -> None:
+    """Use certifi for Daytona HTTPS calls when no CA bundle is configured."""
+    if os.environ.get("SSL_CERT_FILE"):
+        return
+    try:
+        import certifi
+    except ImportError:
+        return
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+
+
+def _is_daytona_fork_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, DaytonaNotFoundError):
+        return True
+    message = str(exc)
+    return "Cannot POST" in message and (
+        "/fork" in message or "/snapshot" in message
+    )
 
 
 class DaytonaClientManager:
@@ -95,6 +139,7 @@ class DaytonaClientManager:
     def __init__(self):
         if not _HAS_DAYTONA:
             raise MissingExtraError(package="daytona", extra="daytona")
+        _ensure_daytona_ssl_cert_file()
         self._client: AsyncDaytona | None = None
         self._client_lock = asyncio.Lock()
         self._logger = logger.getChild(__name__)
@@ -192,6 +237,66 @@ class DaytonaClientManager:
             self._connection_pool_maxsize = None
 
 
+class DaytonaStateCleanup:
+    """Best-effort cleanup helpers for Daytona-backed multiround state."""
+
+    @staticmethod
+    async def delete_sandbox(sandbox_id_or_name: str, logger_) -> None:
+        manager = await DaytonaClientManager.get_instance()
+        daytona = await manager.get_client()
+        try:
+            sandbox = await daytona.get(sandbox_id_or_name)
+        except Exception as exc:
+            logger_.debug(
+                "[multiround] Daytona sandbox %s not found during cleanup: %s",
+                sandbox_id_or_name,
+                exc,
+            )
+            return
+
+        try:
+            await sandbox.delete(timeout=60)
+            return
+        except Exception as exc:
+            logger_.warning(
+                "[multiround] failed deleting Daytona sandbox %s; attempting stop: %s",
+                sandbox_id_or_name,
+                exc,
+            )
+
+        try:
+            await sandbox.stop(timeout=60, force=False)
+        except Exception as stop_exc:
+            logger_.warning(
+                "[multiround] failed stopping Daytona sandbox %s after delete failure: %s",
+                sandbox_id_or_name,
+                stop_exc,
+            )
+
+    @staticmethod
+    async def delete_snapshot(snapshot_name: str, logger_) -> None:
+        manager = await DaytonaClientManager.get_instance()
+        daytona = await manager.get_client()
+        try:
+            snapshot = await daytona.snapshot.get(snapshot_name)
+        except Exception as exc:
+            logger_.debug(
+                "[multiround] Daytona snapshot %s not found during cleanup: %s",
+                snapshot_name,
+                exc,
+            )
+            return
+
+        try:
+            await daytona.snapshot.delete(snapshot)
+        except Exception as exc:
+            logger_.warning(
+                "[multiround] failed deleting Daytona snapshot %s: %s",
+                snapshot_name,
+                exc,
+            )
+
+
 class _DaytonaStrategy:
     """Base for Daytona implementation strategies."""
 
@@ -241,6 +346,188 @@ class _DaytonaStrategy:
 class _DaytonaDirect(_DaytonaStrategy):
     """Direct sandbox strategy — the original single-container behavior."""
 
+    _fork_locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def _fork_lock(cls, sandbox_id_or_name: str) -> asyncio.Lock:
+        lock = cls._fork_locks.get(sandbox_id_or_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._fork_locks[sandbox_id_or_name] = lock
+        return lock
+
+    async def _reset_trial_output_dirs(self) -> None:
+        targets = self._env._mount_targets(writable_only=True)
+        if not targets:
+            return
+        await self._env.reset_dirs(
+            remove_dirs=targets,
+            create_dirs=targets,
+            chmod_dirs=targets,
+        )
+
+    async def _start_from_archive(
+        self,
+        archive_path: Path,
+        *,
+        force_build: bool,
+    ) -> None:
+        env = self._env
+        if not archive_path.exists():
+            raise FileNotFoundError(f"Daytona state archive not found: {archive_path}")
+
+        saved_image_ref = env._resume_state_image_ref
+        saved_archive_path = env._resume_state_archive_path
+        env._resume_state_image_ref = None
+        env._resume_state_archive_path = None
+        try:
+            await self.start(force_build=force_build)
+        finally:
+            env._resume_state_image_ref = saved_image_ref
+            env._resume_state_archive_path = saved_archive_path
+
+        remote_archive = f"/tmp/{env._daytona_state_name('hbrestore', env.session_id)}.tar.gz"
+        await env._sdk_upload_file(archive_path, remote_archive)
+        try:
+            command = (
+                "set -u\n"
+                "tar -C / --skip-old-files "
+                "--no-same-owner --no-same-permissions "
+                f"-xzpf {shlex.quote(remote_archive)}\n"
+                "status=$?\n"
+                'if [ "$status" -gt 1 ]; then exit "$status"; fi\n'
+            )
+            result = await env._sandbox_exec(
+                command,
+                timeout_sec=env._daytona_archive_timeout_sec,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    "Failed to restore Daytona archive: "
+                    f"{result.stdout} {result.stderr}"
+                )
+        finally:
+            await env._sandbox_exec(f"rm -f {shlex.quote(remote_archive)}")
+
+        env.restored_from_snapshot = True
+        await self._reset_trial_output_dirs()
+
+    async def _start_from_fork_source(
+        self,
+        source: str,
+        *,
+        force_build: bool,
+    ) -> None:
+        env = self._env
+        if env._compose_mode:
+            raise RuntimeError(
+                "Daytona pause_fork multiround state is supported only for Direct "
+                "Daytona sandboxes, not DinD/Compose mode."
+            )
+
+        env._client_manager = await DaytonaClientManager.get_instance()
+        await env._configure_daytona_client()
+        daytona = await env._client_manager.get_client()
+
+        archive_fallback: Path | None = None
+
+        async with self._fork_lock(source):
+            parent = await daytona.get(source)
+            parent_state = str(getattr(parent, "state", "")).lower()
+            if "started" not in parent_state:
+                await parent.start(timeout=env._daytona_fork_timeout_sec)
+
+            fork_name = env._daytona_state_name("hbfork", env.session_id)
+            env.logger.debug(
+                "Forking Daytona sandbox %s into %s for multiround resume",
+                source,
+                fork_name,
+            )
+            try:
+                env._sandbox = await parent._experimental_fork(
+                    name=fork_name,
+                    timeout=env._daytona_fork_timeout_sec,
+                )
+            except Exception as exc:
+                if not _is_daytona_fork_unavailable(exc):
+                    raise
+                env.logger.warning(
+                    "Daytona fork endpoint unavailable for %s; falling back to "
+                    "temporary snapshot resume: %s",
+                    source,
+                    exc,
+                )
+                snapshot_name = env._daytona_state_name(
+                    "hbfallback",
+                    f"{env.session_id}-{source}",
+                )
+                try:
+                    await parent._experimental_create_snapshot(
+                        snapshot_name,
+                        timeout=env._daytona_snapshot_timeout_sec,
+                    )
+                    env._transient_resume_snapshot_names.append(snapshot_name)
+                    params = CreateSandboxFromSnapshotParams(
+                        name=env._daytona_state_name("hbsbox", env.session_id),
+                        auto_delete_interval=env._auto_delete_interval,
+                        auto_stop_interval=env._auto_stop_interval,
+                        snapshot=snapshot_name,
+                        network_block_all=env._network_block_all,
+                    )
+                    await env._create_sandbox(params=params)
+                except Exception as snapshot_exc:
+                    if not _is_daytona_fork_unavailable(snapshot_exc):
+                        raise
+                    if not env._resume_state_archive_path:
+                        raise
+                    archive_fallback = Path(env._resume_state_archive_path)
+                    env.logger.warning(
+                        "Daytona sandbox snapshot endpoint unavailable for %s; "
+                        "falling back to local archive resume %s: %s",
+                        source,
+                        archive_fallback,
+                        snapshot_exc,
+                    )
+
+        if archive_fallback is not None:
+            await self._start_from_archive(
+                archive_fallback,
+                force_build=force_build,
+            )
+            return
+
+        env.restored_from_snapshot = True
+        await self._reset_trial_output_dirs()
+
+    async def _cleanup_transient_resume_snapshots(self) -> None:
+        env = self._env
+        snapshot_names = list(env._transient_resume_snapshot_names)
+        env._transient_resume_snapshot_names.clear()
+        for snapshot_name in snapshot_names:
+            await DaytonaStateCleanup.delete_snapshot(snapshot_name, env.logger)
+
+    async def _start_from_snapshot(self, snapshot_name: str) -> None:
+        env = self._env
+        if env._compose_mode:
+            raise RuntimeError(
+                "Daytona snapshot multiround state is supported only for Direct "
+                "Daytona sandboxes, not DinD/Compose mode."
+            )
+
+        env._client_manager = await DaytonaClientManager.get_instance()
+        await env._configure_daytona_client()
+
+        params = CreateSandboxFromSnapshotParams(
+            name=env._daytona_state_name("hbsbox", env.session_id),
+            auto_delete_interval=env._auto_delete_interval,
+            auto_stop_interval=env._auto_stop_interval,
+            snapshot=snapshot_name,
+            network_block_all=env._network_block_all,
+        )
+        await env._create_sandbox(params=params)
+        env.restored_from_snapshot = True
+        await self._reset_trial_output_dirs()
+
     async def start(self, force_build: bool) -> None:
         env = self._env
         resources = Resources(
@@ -248,6 +535,42 @@ class _DaytonaDirect(_DaytonaStrategy):
             memory=env.task_env_config.memory_mb // 1024,
             disk=env.task_env_config.storage_mb // 1024,
         )
+
+        env.restored_from_snapshot = False
+
+        if env._resume_state_image_ref:
+            if env._resume_state_image_ref.startswith(_DAYTONA_FORK_SOURCE_PREFIX):
+                source = env._resume_state_image_ref.removeprefix(
+                    _DAYTONA_FORK_SOURCE_PREFIX
+                )
+                await self._start_from_fork_source(source, force_build=force_build)
+                return
+            if env._resume_state_image_ref.startswith(_DAYTONA_SNAPSHOT_PREFIX):
+                snapshot_name = env._resume_state_image_ref.removeprefix(
+                    _DAYTONA_SNAPSHOT_PREFIX
+                )
+                await self._start_from_snapshot(snapshot_name)
+                return
+            if env._resume_state_image_ref.startswith(_DAYTONA_ARCHIVE_PREFIX):
+                if not env._resume_state_archive_path:
+                    raise RuntimeError(
+                        "Daytona archive resume requires resume_state_archive_path"
+                    )
+                await self._start_from_archive(
+                    Path(env._resume_state_archive_path),
+                    force_build=force_build,
+                )
+                return
+            raise RuntimeError(
+                "Daytona Direct cannot restore non-Daytona multiround state image: "
+                f"{env._resume_state_image_ref}"
+            )
+        if env._resume_state_archive_path:
+            await self._start_from_archive(
+                Path(env._resume_state_archive_path),
+                force_build=force_build,
+            )
+            return
 
         env._client_manager = await DaytonaClientManager.get_instance()
         await env._configure_daytona_client()
@@ -279,6 +602,7 @@ class _DaytonaDirect(_DaytonaStrategy):
         if snapshot_exists and snapshot_name:
             env.logger.debug(f"Using snapshot: {snapshot_name}")
             params = CreateSandboxFromSnapshotParams(
+                name=env._daytona_state_name("hbsbox", env.session_id),
                 auto_delete_interval=env._auto_delete_interval,
                 auto_stop_interval=env._auto_stop_interval,
                 snapshot=snapshot_name,
@@ -313,9 +637,19 @@ class _DaytonaDirect(_DaytonaStrategy):
 
     async def stop(self, delete: bool) -> None:
         env = self._env
+        await self._cleanup_transient_resume_snapshots()
         if not delete:
             env.logger.info(
                 "Keeping Daytona sandbox alive because delete=False: %s",
+                env._sandbox.id if env._sandbox else "<missing>",
+            )
+            env._sandbox = None
+            env._client_manager = None
+            return
+
+        if env._retain_sandbox_as_multiround_state:
+            env.logger.info(
+                "Keeping Daytona sandbox as multiround state source: %s",
                 env._sandbox.id if env._sandbox else "<missing>",
             )
             env._sandbox = None
@@ -928,6 +1262,9 @@ class DaytonaEnvironment(BaseEnvironment):
         if not _HAS_DAYTONA:
             raise MissingExtraError(package="daytona", extra="daytona")
 
+        resume_state_image_ref = kwargs.pop("resume_state_image_ref", None)
+        resume_state_archive_path = kwargs.pop("resume_state_archive_path", None)
+
         # Detect compose mode *before* super().__init__ which calls _validate_definition
         self._compose_mode = (environment_dir / "docker-compose.yaml").exists() or bool(
             extra_docker_compose
@@ -947,6 +1284,33 @@ class DaytonaEnvironment(BaseEnvironment):
         self._auto_stop_interval = auto_stop_interval_mins
         self._auto_delete_interval = auto_delete_interval_mins
         self._snapshot_template_name = snapshot_template_name
+        self._resume_state_image_ref = resume_state_image_ref
+        self._resume_state_archive_path = resume_state_archive_path
+        self._retain_sandbox_as_multiround_state = False
+        self._transient_resume_snapshot_names: list[str] = []
+        self._daytona_multiround_state_mode = str(
+            self._kwargs.get("multiround_state_mode", "auto")
+        ).replace("-", "_")
+        if self._daytona_multiround_state_mode not in _DAYTONA_STATE_MODES:
+            raise ValueError(
+                "multiround_state_mode must be one of: auto, pause_fork, snapshot, archive"
+            )
+        self._daytona_fork_timeout_sec = _coerce_int(
+            self._kwargs.get("daytona_fork_timeout_sec"),
+            120,
+        )
+        self._daytona_snapshot_timeout_sec = _coerce_int(
+            self._kwargs.get("daytona_snapshot_timeout_sec"),
+            300,
+        )
+        self._daytona_stop_timeout_sec = _coerce_int(
+            self._kwargs.get("daytona_stop_timeout_sec"),
+            60,
+        )
+        self._daytona_archive_timeout_sec = _coerce_int(
+            self._kwargs.get("daytona_archive_timeout_sec"),
+            900,
+        )
         if network_block_all is not None:
             self._network_block_all = network_block_all
             expected = not task_env_config.allow_internet
@@ -996,6 +1360,158 @@ class DaytonaEnvironment(BaseEnvironment):
             path = self._dockerfile_path
         if not path.exists():
             raise FileNotFoundError(f"{path} not found. Please ensure the file exists.")
+
+    @staticmethod
+    def _daytona_state_name(prefix: str, raw: str) -> str:
+        return _daytona_resource_name(prefix, raw)
+
+    def _resolved_multiround_state_mode(self) -> str:
+        if self._daytona_multiround_state_mode == "auto":
+            return "pause_fork"
+        return self._daytona_multiround_state_mode
+
+    async def _capture_filesystem_archive(
+        self,
+        snapshot_id: str,
+        archive_path: Path | None,
+    ) -> dict[str, str]:
+        if archive_path is None:
+            raise RuntimeError("Daytona archive state capture requires archive_path")
+
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        remote_name = f"{self._daytona_state_name('hbstate', snapshot_id)}.tar.gz"
+        remote_archive = f"/tmp/{remote_name}"
+        exclude_args = " ".join(
+            shlex.quote(item)
+            for item in [
+                "--one-file-system",
+                "--exclude=./proc",
+                "--exclude=./sys",
+                "--exclude=./dev",
+                "--exclude=./run",
+                "--exclude=./logs",
+                "--exclude=./etc/hosts",
+                "--exclude=./etc/hostname",
+                "--exclude=./etc/resolv.conf",
+                "--exclude=./etc/mtab",
+                "--exclude=./usr/lib/modules",
+                "--exclude=./usr/src/linux-headers-*",
+                "--exclude=./usr/local/bin/daytona",
+                "--exclude=./usr/local/lib/daytona-computer-use",
+                f"--exclude=./tmp/{remote_name}",
+            ]
+        )
+        command = (
+            "set -u\n"
+            f"tar -C / {exclude_args} -czpf {shlex.quote(remote_archive)} .\n"
+            "status=$?\n"
+            'if [ "$status" -gt 1 ]; then exit "$status"; fi\n'
+        )
+
+        try:
+            result = await self._sandbox_exec(
+                command,
+                timeout_sec=self._daytona_archive_timeout_sec,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    "Failed to create Daytona archive state: "
+                    f"{result.stdout} {result.stderr}"
+                )
+            await self._sdk_download_file(remote_archive, archive_path)
+        finally:
+            try:
+                await self._sandbox_exec(f"rm -f {shlex.quote(remote_archive)}")
+            except Exception as exc:
+                self.logger.debug(
+                    "Failed to remove temporary Daytona archive %s: %s",
+                    remote_archive,
+                    exc,
+                )
+
+        archive_ref = str(archive_path.resolve().absolute())
+        return {
+            "snapshot_id": snapshot_id,
+            "provider": "daytona",
+            "provider_state_mode": "archive",
+            "image_ref": f"{_DAYTONA_ARCHIVE_PREFIX}{snapshot_id}",
+            "image_tag": f"{_DAYTONA_ARCHIVE_PREFIX}{snapshot_id}",
+            "archive_path": archive_ref,
+        }
+
+    async def capture_state_snapshot(
+        self,
+        snapshot_id: str,
+        archive_path: Path | None = None,
+        restart_container: bool = False,
+    ) -> dict[str, str] | None:
+        if self._compose_mode:
+            raise RuntimeError(
+                "Daytona multiround state capture is supported only for Direct "
+                "Daytona sandboxes. DinD/Compose mode is intentionally unsupported."
+            )
+        if not self._sandbox:
+            self.logger.warning(
+                "Cannot capture Daytona state %s: sandbox not found",
+                snapshot_id,
+            )
+            return None
+
+        mode = self._resolved_multiround_state_mode()
+        if mode == "archive":
+            return await self._capture_filesystem_archive(snapshot_id, archive_path)
+
+        if mode == "snapshot":
+            snapshot_name = self._daytona_state_name("hbsnap", snapshot_id)
+            try:
+                await self._sandbox._experimental_create_snapshot(
+                    snapshot_name,
+                    timeout=self._daytona_snapshot_timeout_sec,
+                )
+            except Exception as exc:
+                if not _is_daytona_fork_unavailable(exc):
+                    raise
+                self.logger.warning(
+                    "Daytona sandbox snapshot endpoint unavailable; falling back "
+                    "to local archive state %s: %s",
+                    archive_path,
+                    exc,
+                )
+                return await self._capture_filesystem_archive(
+                    snapshot_id,
+                    archive_path,
+                )
+            return {
+                "snapshot_id": snapshot_id,
+                "provider": "daytona",
+                "provider_state_mode": "snapshot",
+                "image_ref": f"{_DAYTONA_SNAPSHOT_PREFIX}{snapshot_name}",
+                "image_tag": f"{_DAYTONA_SNAPSHOT_PREFIX}{snapshot_name}",
+                "archive_path": "",
+                "daytona_snapshot_name": snapshot_name,
+            }
+
+        sandbox_id = str(self._sandbox.id)
+        sandbox_name = str(getattr(self._sandbox, "name", "") or "")
+        archive_data = await self._capture_filesystem_archive(
+            snapshot_id,
+            archive_path,
+        )
+        await self._sandbox.stop(
+            timeout=self._daytona_stop_timeout_sec,
+            force=False,
+        )
+        self._retain_sandbox_as_multiround_state = True
+        return {
+            "snapshot_id": snapshot_id,
+            "provider": "daytona",
+            "provider_state_mode": "pause_fork",
+            "image_ref": f"{_DAYTONA_FORK_SOURCE_PREFIX}{sandbox_id}",
+            "image_tag": f"{_DAYTONA_FORK_SOURCE_PREFIX}{sandbox_id}",
+            "archive_path": archive_data["archive_path"],
+            "daytona_sandbox_id": sandbox_id,
+            "daytona_sandbox_name": sandbox_name,
+        }
 
     # ── Shared helpers used by both strategies ──────────────────────────
 

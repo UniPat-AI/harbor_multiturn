@@ -38,8 +38,14 @@ Current status:
 
 - Done: resume output planning lives in `harbor.multiround.resume_plan` with
   direct unit coverage.
-- Next: apply the same pattern to roundwise fanout selection once upstream
-  merge pressure or feature work touches that area.
+- Done: default roundwise `success` snapshot capture is selected-only, using a
+  small live-trial extension instead of changing the ordinary single-run queue
+  path.
+- Done: default roundwise snapshot retention is `latest`, so the ordinary path
+  maintains only the latest selected round image while `selected` and `all`
+  remain explicit debugging/maintenance modes.
+- Next: keep extracting pure fanout selection helpers when upstream merge
+  pressure or feature work touches that area.
 
 ## P1: Safer Resume Operations
 
@@ -122,15 +128,20 @@ Current Daytona position:
 
 - Harbor's Docker environment implements the current per-round state snapshot
   contract through `capture_state_snapshot()`.
-- Daytona supports remote sandboxes, Docker/DinD execution, and Daytona-level
-  startup snapshots.
-- Daytona-backed fresh multiturn runs use the normal Harbor remote environment
-  path.
-- Daytona-backed resume / roundwise becomes a supported path when the Daytona
-  adapter advertises Harbor-compatible round snapshot capture/restore metadata.
-- The current maintenance gate includes local Daytona preflight; the next
-  capability step is a credentialed smoke gate that records the adapter
-  snapshot fields Harbor needs.
+- Daytona Direct now implements the same Harbor contract through two explicit
+  modes: default `pause_fork`, optional `snapshot`, and explicit `archive`.
+- `pause_fork` stores the selected sandbox id as the next round's fork source,
+  deletes unselected siblings, and saves a local rootfs archive fallback. Child
+  trials prefer Daytona fork, then dynamic sandbox snapshot, then local archive
+  restore when the service does not expose the experimental endpoints.
+- `snapshot` creates a Daytona snapshot at the round boundary when the service
+  supports it; otherwise it records a local archive state.
+- Daytona snapshot metadata is provider-specific but persists through the same
+  `state/round_N/snapshot.json` shape used by Docker.
+- DinD/Compose-backed Daytona environments are intentionally outside the
+  multiturn state backend contract.
+- The maintenance gate includes local Daytona preflight and unit coverage; the
+  credentialed gate runs Direct Daytona MT@K/SR on a real three-round task.
 
 ## P5: Maintenance Automation
 

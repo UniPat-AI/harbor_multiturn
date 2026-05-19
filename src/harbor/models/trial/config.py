@@ -158,6 +158,7 @@ class VerifierConfig(BaseModel):
     disable: bool = False
     multiround_continue_successes_per_round: int = Field(default=1, ge=1)
     multiround_state_cache_policy: str = "success"
+    multiround_state_retention_policy: str = "latest"
     multiround_resume_preflight_policy: str = "strict"
     multiround_max_round: int | None = None
     multiround_start_round: int | None = None
@@ -175,6 +176,12 @@ class VerifierConfig(BaseModel):
         if self.multiround_state_cache_policy not in allowed:
             raise ValueError(
                 "multiround_state_cache_policy must be one of: off, success, all"
+            )
+        allowed_retention = {"latest", "selected", "all"}
+        if self.multiround_state_retention_policy not in allowed_retention:
+            raise ValueError(
+                "multiround_state_retention_policy must be one of: "
+                "latest, selected, all"
             )
         allowed_preflight = {"off", "snapshot", "strict"}
         if self.multiround_resume_preflight_policy not in allowed_preflight:

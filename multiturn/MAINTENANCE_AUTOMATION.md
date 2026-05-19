@@ -1,49 +1,45 @@
 # Maintenance Automation Boundary
 
-This document defines what the local multiturn maintenance flow can automate and
-what must stay under human review. The goal is repeatability without turning
-upstream Harbor updates into unattended semantic merges.
+This document defines the local multiturn maintenance split between repeatable
+automation and human review. The goal is a predictable upstream update loop for
+`multiturn/main`.
 
-## Automated
+## Automated Gate
 
-Automation may do the following without changing stable branches:
+Automation owns repeatable checks and summaries:
 
 - Fetch upstream Harbor into local tracking refs.
 - Run deterministic gates:
   - Harbor multiturn unit subset.
   - Parent `tests/manifests/multiturn_core.txt`.
   - Shell syntax checks and whitespace checks.
-- Validate local Daytona environment variables without printing secrets.
+- Validate local Daytona environment variables with redacted credential output.
 - Launch credentialed MT@4/SR jobs when the operator has explicitly provided
   local credentials and accepted the cost/runtime.
 - Summarize changed files, conflicts, failing tests, and likely conflict zones
   after the maintainer starts a manual merge.
 
-Automation must not create or maintain upstream-merge branches. It also should
-not decide whether an upstream behavior change is accepted.
-
 ## Human Review
 
-A maintainer must decide:
+A maintainer owns semantic decisions and repository mutation:
 
-- Whether an upstream Harbor behavioral change should replace local multiturn
+- Upstream Harbor behavioral changes that should replace local multiturn
   behavior or be wrapped by a multiturn compatibility hook.
-- Whether to run an optional manual detached-worktree merge rehearsal.
-- How to resolve conflicts in lifecycle, CLI, task parsing, environment setup,
+- Optional manual detached-worktree merge rehearsal.
+- Conflict resolution in lifecycle, CLI, task parsing, environment setup,
   agent continuation state, verifier output, and job fanout.
-- Whether credentialed MT@4/SR results are acceptable for release-like use.
-- Whether to commit and push `multiturn/main`.
-- Whether to advance the parent repository's `harbor/` gitlink.
-- Whether local credentials, run logs, or generated outputs accidentally entered
-  a staged diff.
+- Credentialed MT@4/SR release-like acceptance.
+- Commit and push approval for `multiturn/main`.
+- Parent repository `harbor/` gitlink updates.
+- Final staged diff review for credentials, run logs, and generated outputs.
 
-Agents may propose conflict resolutions and edit code, tests, and docs, but they
-should leave merge commits and pushes to explicit maintainer approval.
+Agents may propose conflict resolutions and edit code, tests, and docs. Merge
+commits and pushes happen after explicit maintainer approval.
 
 ## Daytona Checks
 
-Daytona credentials are local-only. The committed repo may document required
-variable names, but must not contain real keys.
+Daytona credentials live in local environment configuration. The committed repo
+documents variable names and lifecycle settings.
 
 Before launching a Daytona-backed credentialed run:
 

@@ -17,16 +17,17 @@ The intended long-term shape is:
 
 ```text
 origin/main          # moving upstream Harbor input
-multi_turn_support   # stable multiturn fallback, do not advance during routine upstream syncs
+multi_turn_support   # stable multiturn fallback
 multiturn/main       # moving integration branch: merge origin/main, repair overlay, test, then update parent gitlink
 ```
 
-Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support` available so a regression in the merged integration branch can be bisected or rolled back without hunting through merge commits.
+Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support`
+available as the stable rollback and bisection baseline.
 
 ## Optional Manual Rehearsal
 
 Before mutating `multiturn/main`, the maintainer may manually rehearse the
-upstream merge in a detached worktree. This is optional and creates no branch:
+upstream merge in a detached worktree:
 
 ```bash
 cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
@@ -52,8 +53,8 @@ Discard the rehearsal after inspection:
 git -C harbor worktree remove --force data/maintenance/upstream_merge_dry_run/harbor
 ```
 
-Do not keep a rehearsal branch. The maintained branch set remains
-`origin/main`, `multi_turn_support`, and `multiturn/main`.
+The maintained branch set remains `origin/main`, `multi_turn_support`, and
+`multiturn/main`.
 
 ## Standard Update
 
@@ -89,7 +90,7 @@ Only stage the submodule gitlink and the multiturn docs/tests you intentionally 
 
 ## Conflict Policy
 
-Prefer upstream Harbor structure, then reapply the local multiturn hooks. Do not revive removed upstream architecture just because older multiturn code depended on it.
+Prefer upstream Harbor structure, then reapply the local multiturn hooks.
 
 Common conflict zones:
 
@@ -106,15 +107,16 @@ Common conflict zones:
 
 ## Conflict Reduction Rules
 
-- Keep local documentation in `multiturn/`; do not edit upstream `README.md` for local behavior.
-- Keep deterministic black-box maintenance tests in the parent `tests/` harness; do not duplicate them inside upstream Harbor examples.
+- Keep local documentation in `multiturn/`.
+- Keep deterministic black-box maintenance tests in the parent `tests/` harness.
 - Keep new local runtime behavior behind existing Harbor extension points.
-- Move pure multiturn planning and selection logic into `src/harbor/multiround/` when it does not need CLI or Trial side effects.
-- Avoid broad formatting rewrites in files that upstream changes frequently.
-- Use merge commits, not rebases, for `multiturn/main`.
+- Move pure multiturn planning and selection logic into `src/harbor/multiround/`
+  when it is independent from CLI or Trial side effects.
+- Preserve upstream formatting in files that upstream changes frequently.
+- Use merge commits for `multiturn/main`.
 - Separate commits by purpose: upstream merge, local conflict repair, docs/tests.
-- Keep the generated `mleval` fixture under the parent `tests/tasks/` tree, not inside Harbor upstream paths.
-- Prefer adding local multiturn docs under `harbor/multiturn/`; avoid editing upstream documentation unless the upstream project itself changed the contract.
+- Keep the generated `mleval` fixture under the parent `tests/tasks/` tree.
+- Prefer adding local multiturn docs under `harbor/multiturn/`; update upstream documentation only when the upstream project contract changes.
 
 ## Recurring Maintenance Checklist
 
@@ -137,4 +139,5 @@ git log --oneline --decorate --graph --first-parent multiturn/main
 git switch backup/multiturn-main-before-upstream-<stamp>
 ```
 
-To return `multiturn/main` to a known backup, create a new branch or use a non-destructive revert. Avoid `git reset --hard` unless the caller explicitly requests it.
+To return `multiturn/main` to a known backup, create a new branch or use a
+non-destructive revert.

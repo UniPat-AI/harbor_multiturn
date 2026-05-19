@@ -16,7 +16,7 @@ marks a breaking change. The following interfaces stay compatible:
 - Existing output paths under `verifier/`, `state/`, and `agent/`.
 - Existing black-box test entrypoints in the parent `tests/` directory.
 - Existing maintenance branch model: merge upstream `origin/main` into
-  `multiturn/main`; do not rebase the maintained integration branch.
+  `multiturn/main` with merge commits on the maintained integration branch.
 
 New behavior should be enabled by new flags, new optional metadata, or internal
 helpers with unchanged user-visible defaults.
@@ -31,7 +31,8 @@ large upstream Harbor files.
   backup, cleanup, and config persistence.
 - Add direct unit tests for resume planning so upstream CLI churn can be
   audited separately from multiturn semantics.
-- Continue keeping multiturn docs and CI outside Harbor upstream docs/workflows.
+- Keep multiturn docs and CI in the local overlay and parent harness, separate
+  from Harbor upstream docs/workflows.
 
 Current status:
 
@@ -55,23 +56,23 @@ Goal: make resume intent easier to inspect before mutating a source trial.
 
 Current status:
 
-- Done: `--resume-dry-run` prints the resolved source, output mode, jobs
-  directory, backup intent, planned resume source, and config trial name without
-  mutating the source trial or starting a job. It is covered by direct unit
-  tests and the black-box parameter validation case.
+- Done: `--resume-dry-run` reports the resolved source, output mode, jobs
+  directory, backup intent, planned resume source, and config trial name as an
+  inspection-only command. It is covered by direct unit tests and the black-box
+  parameter validation case.
 - Next: add an explicit resume mode flag only if operators need a clearer
   spelling than the existing `--output-jobs-dir` / `--no-resume-backup` split.
 
 ## P2: Fanout Selection and Lineage Observability
 
-Goal: make MT@K selection behavior easier to audit without changing default
+Goal: make MT@K selection behavior easier to audit while preserving default
 ranking.
 
 - Isolate frontier selection into a pure planner module.
 - Keep current first-success parent selection as the default.
 - Add optional future selection policies only behind explicit flags.
 - Persist a compact lineage summary for each child trial and expose it to the
-  viewer without changing existing artifact paths.
+  viewer while preserving existing artifact paths.
 
 ## P3: Artifact Schema and Viewer Support
 
@@ -84,10 +85,12 @@ Goal: make generated task regressions and human debugging easier.
 
 Necessity:
 
+- Done: `tests/validate_multiturn_artifacts.py` validates the current stable
+  trial artifact shape for `multiround_results.json`, snapshot metadata, and
+  resume lineage metadata. The Oracle full-run smoke case invokes it for the
+  3-round baseline.
 - Schema/golden checks are required for machine-consumed artifacts that feed
   CI, evaluator summaries, resume preflight, and future viewer pages.
-- They are not required for transient logs or purely human-readable progress
-  lines unless those lines become parser inputs.
 - The first useful target is the stable artifact set:
   `multiround_results.json`, `state/round_N/snapshot.json`,
   `agent/pre_resume_*/metadata.json`, and trajectory round annotations.
@@ -101,29 +104,40 @@ Goal: support more Harbor environments while preserving Docker behavior.
 - Add remote-environment snapshot metadata only when an environment advertises
   the capability.
 
+Resume ownership model:
+
+- Harbor owns resume semantics: round selection, source trial resolution,
+  snapshot metadata selection, artifact copy/cleanup, lineage recording, and
+  aggregate reward windows.
+- The environment adapter owns state materialization: creating a runnable
+  workspace/container from a snapshot, capturing a new snapshot at the end of a
+  round, and returning portable metadata to Harbor.
+- This split keeps trial artifacts, CLI behavior, and future viewer summaries
+  stable across local Docker and remote providers.
+
 Current Daytona position:
 
 - Harbor's Docker environment implements the current per-round state snapshot
   contract through `capture_state_snapshot()`.
 - Daytona supports remote sandboxes, Docker/DinD execution, and Daytona-level
-  startup snapshots, but the current `DaytonaEnvironment` does not implement
-  Harbor's per-round `capture_state_snapshot()` contract.
-- Fresh multiturn runs can be configured for Daytona, but resume/fanout paths
-  that require Harbor round snapshots must not assume Daytona snapshots are
-  automatically equivalent.
-- The next safe step is a credentialed Daytona smoke gate plus explicit
-  capability work before enabling Daytona as a resume/fanout snapshot backend.
+  startup snapshots.
+- Daytona-backed fresh multiturn runs use the normal Harbor remote environment
+  path.
+- Daytona-backed resume/fanout becomes a supported path when the Daytona
+  adapter advertises Harbor-compatible round snapshot capture/restore metadata.
+- The current maintenance gate includes local Daytona preflight; the next
+  capability step is a credentialed smoke gate that records the adapter
+  snapshot fields Harbor needs.
 
 ## P5: Maintenance Automation
 
 Goal: catch upstream Harbor drift earlier.
 
 - Keep the deterministic parent workflow as the required merge gate.
-- Keep upstream-merge rehearsal as a documented manual command, not a maintained
-  automation branch or script.
-- Keep credentialed Terminus-2 MT@4 and SR tests as release-like validation
-  rather than mandatory pull-request CI.
-- Record only stable commands and current expected outputs in docs; do not store
-  run logs or credentials.
+- Keep upstream-merge rehearsal as a documented manual detached-worktree command.
+- Keep credentialed Terminus-2 MT@4 and SR tests in the release-like validation
+  tier where operators explicitly provide local credentials and runtime budget.
+- Record stable commands and current expected outputs in docs. Runtime logs and
+  credentials stay in local ignored paths.
 
 Automation boundary is documented in `MAINTENANCE_AUTOMATION.md`.

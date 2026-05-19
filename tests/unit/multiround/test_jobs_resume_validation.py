@@ -523,6 +523,59 @@ def test_start_accepts_resume_job_dir_and_uses_selected_child(tmp_path: Path):
     assert captured["start_round"] == 3
 
 
+def test_start_in_place_resume_removes_stale_job_lock(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    job_dir = tmp_path / "2026-04-07__12-00-00"
+    job_dir.mkdir()
+    (job_dir / "lock.json").write_text('{"schema_version": 1}\n')
+
+    selected_trial = job_dir / "selected-trial"
+    TrialPaths(trial_dir=selected_trial).mkdir()
+    _write_source_trial_config(
+        selected_trial,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_multiround_source_trial_result(
+        selected_trial,
+        completed_round=1,
+        reward=1.0,
+    )
+    _write_round_snapshot_metadata(selected_trial, round_num=1)
+
+    import harbor.cli.jobs as jobs_module
+    import harbor.job as job_module
+
+    captured = {}
+
+    async def fake_run(self):
+        captured["lock_exists_at_run"] = (job_dir / "lock.json").exists()
+        return SimpleNamespace(stats=SimpleNamespace(evals={}))
+
+    original_job_run = job_module.Job.run
+    original_show_hint = jobs_module.show_registry_hint_if_first_run
+    original_print_tables = jobs_module.print_job_results_tables
+
+    job_module.Job.run = fake_run
+    jobs_module.show_registry_hint_if_first_run = lambda console: None
+    jobs_module.print_job_results_tables = lambda _: None
+    try:
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_trial=selected_trial,
+            resume_round=2,
+        )
+    finally:
+        job_module.Job.run = original_job_run
+        jobs_module.show_registry_hint_if_first_run = original_show_hint
+        jobs_module.print_job_results_tables = original_print_tables
+
+    assert captured["lock_exists_at_run"] is False
+
+
 def test_start_accepts_resume_job_dir_and_uses_selected_child_for_claude(
     tmp_path: Path,
 ):

@@ -24,6 +24,7 @@ from harbor.models.job.config import (
     DatasetConfig,
     JobConfig,
 )
+from harbor.models.job.lock import LOCK_FILENAME
 from harbor.models.job.result import JobStats
 from harbor.models.task.task import Task
 from harbor.models.trial.config import (
@@ -2337,7 +2338,7 @@ def start(
                 _cleanup_trial_for_resume(resolved_resume, resolved_resume_round)
                 resume_source_dir = backup_dir
 
-            for name in ("result.json", "config.json"):
+            for name in ("result.json", "config.json", LOCK_FILENAME):
                 path_to_remove = trial_parent / name
                 if path_to_remove.exists():
                     path_to_remove.unlink()

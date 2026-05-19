@@ -6,6 +6,7 @@
 - The local fork carries multiturn Terminal-Bench execution support; when changing Harbor behavior, also check the parent `DESIGN.md`, `IMPLEMENTATION.md`, `USAGE.md`, and `TEST.md`.
 - Keep documents focused on the current final state. Do not record merge history, failed attempts, or temporary debugging notes.
 - Multiturn-sensitive code is concentrated under `src/harbor/`, with regression coverage in `tests/unit/` and the parent repository's `tests/` harness.
+- Local multiturn documentation lives under `multiturn/`; keep it separate from upstream Harbor README/docs to reduce recurring merge conflicts.
 
 > **Breaking changes**: See [CHANGELOG.md](CHANGELOG.md) for recent breaking changes to the agent and environment APIs and migration guidance.
 

@@ -9,8 +9,8 @@ upstream Harbor updates into unattended semantic merges.
 Automation may do the following without changing stable branches:
 
 - Fetch upstream Harbor into local tracking refs.
-- Prepare a dry-run merge on the fixed local branch
-  `multiturn/upstream-merge-dry-run`.
+- Prepare a dry-run merge in a fixed detached worktree under
+  `data/maintenance/upstream_merge_dry_run/harbor`.
 - Run deterministic gates:
   - Harbor multiturn unit subset.
   - Parent `tests/manifests/multiturn_core.txt`.
@@ -20,8 +20,8 @@ Automation may do the following without changing stable branches:
   local credentials and accepted the cost/runtime.
 - Summarize changed files, conflicts, failing tests, and likely conflict zones.
 
-Automation must be idempotent where possible. Reuse the fixed dry-run branch
-instead of creating a new temporary branch for each upstream update.
+Automation must be idempotent where possible. Reuse the fixed dry-run worktree
+instead of creating any temporary branches for upstream updates.
 
 ## Human Review
 
@@ -40,9 +40,9 @@ A maintainer must decide:
 Agents may propose conflict resolutions and edit code, tests, and docs, but they
 should leave merge commits and pushes to explicit maintainer approval.
 
-## Fixed Dry-Run Branch
+## Fixed Dry-Run Worktree
 
-Use the same temporary branch for every upstream merge rehearsal:
+Use the same detached worktree path for every upstream merge rehearsal:
 
 ```bash
 cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
@@ -55,13 +55,13 @@ Default refs:
 BASE_BRANCH=multiturn/main
 UPSTREAM_REMOTE=origin
 UPSTREAM_BRANCH=main
-DRY_RUN_BRANCH=multiturn/upstream-merge-dry-run
+DRY_RUN_WORKTREE=data/maintenance/upstream_merge_dry_run/harbor
 ```
 
-The script leaves the merge uncommitted on the dry-run branch so a maintainer or
-agent can inspect the exact combined tree. After inspection, either commit it on
-that branch for further review or discard it with `git merge --abort` and return
-to `multiturn/main`.
+The script creates no branch. It checks out `multiturn/main` into the detached
+worktree, performs `origin/main --no-commit --no-ff` there, and leaves the merge
+uncommitted so a maintainer or agent can inspect the exact combined tree. After
+inspection, discard the worktree with `git worktree remove --force`.
 
 ## Daytona Checks
 

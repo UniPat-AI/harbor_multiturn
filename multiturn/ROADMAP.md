@@ -119,8 +119,8 @@ Current Daytona position:
 Goal: catch upstream Harbor drift earlier.
 
 - Keep the deterministic parent workflow as the required merge gate.
-- Add an optional upstream-merge dry run against `origin/main` that reuses the
-  fixed branch `multiturn/upstream-merge-dry-run`.
+- Add an optional upstream-merge dry run against `origin/main` that reuses a
+  fixed detached worktree under `data/maintenance/upstream_merge_dry_run/harbor`.
 - Keep credentialed Terminus-2 MT@4 and SR tests as release-like validation
   rather than mandatory pull-request CI.
 - Record only stable commands and current expected outputs in docs; do not store

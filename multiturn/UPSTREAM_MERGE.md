@@ -10,7 +10,6 @@ Use these roles consistently:
 | `multi_turn_support` | Stable pre-upstream-merge multiturn branch. This is the rollback baseline and the remote default branch for users who need the known-good old multiturn code. |
 | `multiturn/main` | Maintained integration branch for daily work: latest upstream Harbor plus the multiturn overlay. New upstream Harbor releases are merged here. |
 | parent repo `master` | Records the selected `harbor/` submodule commit and owns the `multiturnpp` docs/tests. |
-| `multiturn/upstream-merge-dry-run` | Fixed local temporary branch for repeated upstream merge rehearsals. Reuse this branch instead of creating new throwaway branches. |
 | `backup/multiturn-main-before-upstream-*` | Per-merge rollback branches. |
 | `backup/multiturn-main-before-upstream-*` tags | Per-merge immutable rollback labels. |
 
@@ -26,8 +25,8 @@ Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support` av
 
 ## Fixed Dry-Run Merge
 
-Before mutating `multiturn/main`, rehearse the upstream merge on one fixed local
-branch:
+Before mutating `multiturn/main`, rehearse the upstream merge in one fixed
+detached worktree. This creates no branch:
 
 ```bash
 cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
@@ -40,13 +39,14 @@ Defaults:
 BASE_BRANCH=multiturn/main
 UPSTREAM_REMOTE=origin
 UPSTREAM_BRANCH=main
-DRY_RUN_BRANCH=multiturn/upstream-merge-dry-run
+DRY_RUN_WORKTREE=data/maintenance/upstream_merge_dry_run/harbor
 ```
 
-The script switches Harbor to `DRY_RUN_BRANCH`, merges
-`origin/main --no-commit --no-ff`, and runs the deterministic maintenance gate
-unless `--no-tests` is passed. It leaves the merge uncommitted so a human or
-agent can inspect conflicts and semantic changes. Reusing this branch keeps the
+The script creates a detached worktree from `multiturn/main`, merges
+`origin/main --no-commit --no-ff` inside that worktree, and runs the
+deterministic maintenance gate with `HARBOR_DIR` pointed at the worktree unless
+`--no-tests` is passed. It leaves the merge uncommitted so a human or agent can
+inspect conflicts and semantic changes. Reusing this worktree keeps the
 repository from accumulating one-off temporary branches.
 
 ## Standard Update

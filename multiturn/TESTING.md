@@ -40,9 +40,12 @@ Useful variants:
 bash tests/run_multiturn_maintenance.sh --unit-only
 bash tests/run_multiturn_maintenance.sh --blackbox-only
 bash tests/run_multiturn_maintenance.sh --cleanup
+bash tests/run_multiturn_maintenance.sh --daytona-preflight --unit-only
 ```
 
 `--cleanup` forwards cleanup to the black-box harness so per-case job directories are removed after each case.
+`--daytona-preflight` validates local Daytona variables without printing
+`DAYTONA_API_KEY`; it does not contact Daytona or launch a sandbox.
 
 ## Unit Coverage
 
@@ -108,6 +111,21 @@ cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
 export TASKS_DIR=/home/shenhaiyang/Source/swebenchpp/multiturnpp/tests/tasks
 export TASK_NAME=theme_d10_w11_ml_ai_mlops_automation_scripting
 ```
+
+For Daytona-backed smoke runs, configure the sandbox locally before launching:
+
+```bash
+export HARBOR_ENV=daytona
+export HARBOR_ENV_KWARGS=network_block_all=false,auto_stop_interval_mins=120,auto_delete_interval_mins=240
+export DAYTONA_API_URL=https://app.daytona.io/api
+export DAYTONA_TARGET=us
+# DAYTONA_API_KEY must already be set in the local shell/profile/task .env.
+bash tests/check_daytona_multiturn_env.sh
+```
+
+Daytona currently validates fresh-run plumbing. Do not treat it as equivalent
+to Docker for resume/fanout snapshot coverage until `DaytonaEnvironment`
+implements Harbor's per-round `capture_state_snapshot()` contract.
 
 MT@4:
 

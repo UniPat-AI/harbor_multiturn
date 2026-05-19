@@ -10,6 +10,7 @@ Use these roles consistently:
 | `multi_turn_support` | Stable pre-upstream-merge multiturn branch. This is the rollback baseline and the remote default branch for users who need the known-good old multiturn code. |
 | `multiturn/main` | Maintained integration branch for daily work: latest upstream Harbor plus the multiturn overlay. New upstream Harbor releases are merged here. |
 | parent repo `master` | Records the selected `harbor/` submodule commit and owns the `multiturnpp` docs/tests. |
+| `multiturn/upstream-merge-dry-run` | Fixed local temporary branch for repeated upstream merge rehearsals. Reuse this branch instead of creating new throwaway branches. |
 | `backup/multiturn-main-before-upstream-*` | Per-merge rollback branches. |
 | `backup/multiturn-main-before-upstream-*` tags | Per-merge immutable rollback labels. |
 
@@ -22,6 +23,31 @@ multiturn/main       # moving integration branch: merge origin/main, repair over
 ```
 
 Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support` available so a regression in the merged integration branch can be bisected or rolled back without hunting through merge commits.
+
+## Fixed Dry-Run Merge
+
+Before mutating `multiturn/main`, rehearse the upstream merge on one fixed local
+branch:
+
+```bash
+cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
+bash tests/upstream_merge_dry_run.sh
+```
+
+Defaults:
+
+```text
+BASE_BRANCH=multiturn/main
+UPSTREAM_REMOTE=origin
+UPSTREAM_BRANCH=main
+DRY_RUN_BRANCH=multiturn/upstream-merge-dry-run
+```
+
+The script switches Harbor to `DRY_RUN_BRANCH`, merges
+`origin/main --no-commit --no-ff`, and runs the deterministic maintenance gate
+unless `--no-tests` is passed. It leaves the merge uncommitted so a human or
+agent can inspect conflicts and semantic changes. Reusing this branch keeps the
+repository from accumulating one-off temporary branches.
 
 ## Standard Update
 
@@ -88,12 +114,13 @@ Common conflict zones:
 
 For each upstream Harbor update:
 
-1. Backup `multiturn/main` with a branch and tag before merging.
-2. Merge `origin/main` into `multiturn/main`.
-3. Resolve conflicts by keeping upstream structure first, then reapplying multiturn hooks.
-4. Run `bash tests/run_multiturn_maintenance.sh`.
-5. If agent/session code changed, also run the credentialed Terminus-2 generated-task MT@4/SR commands from `TESTING.md`.
-6. Commit Harbor, update the parent submodule pointer, and commit parent docs/tests.
+1. Run the fixed dry-run merge and inspect the resulting tree.
+2. Backup `multiturn/main` with a branch and tag before the real merge.
+3. Merge `origin/main` into `multiturn/main`.
+4. Resolve conflicts by keeping upstream structure first, then reapplying multiturn hooks.
+5. Run `bash tests/run_multiturn_maintenance.sh`.
+6. If agent/session/environment code changed, also run the credentialed Terminus-2 generated-task MT@4/SR commands from `TESTING.md`.
+7. Commit Harbor, update the parent submodule pointer, and commit parent docs/tests.
 
 ## Rollback
 

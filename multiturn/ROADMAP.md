@@ -82,6 +82,16 @@ Goal: make generated task regressions and human debugging easier.
 - Build a viewer-side multiturn summary from existing artifacts first.
 - Add optional richer viewer metadata after the summary is stable.
 
+Necessity:
+
+- Schema/golden checks are required for machine-consumed artifacts that feed
+  CI, evaluator summaries, resume preflight, and future viewer pages.
+- They are not required for transient logs or purely human-readable progress
+  lines unless those lines become parser inputs.
+- The first useful target is the stable artifact set:
+  `multiround_results.json`, `state/round_N/snapshot.json`,
+  `agent/pre_resume_*/metadata.json`, and trajectory round annotations.
+
 ## P4: Environment Snapshot Portability
 
 Goal: support more Harbor environments while preserving Docker behavior.
@@ -91,13 +101,29 @@ Goal: support more Harbor environments while preserving Docker behavior.
 - Add remote-environment snapshot metadata only when an environment advertises
   the capability.
 
+Current Daytona position:
+
+- Harbor's Docker environment implements the current per-round state snapshot
+  contract through `capture_state_snapshot()`.
+- Daytona supports remote sandboxes, Docker/DinD execution, and Daytona-level
+  startup snapshots, but the current `DaytonaEnvironment` does not implement
+  Harbor's per-round `capture_state_snapshot()` contract.
+- Fresh multiturn runs can be configured for Daytona, but resume/fanout paths
+  that require Harbor round snapshots must not assume Daytona snapshots are
+  automatically equivalent.
+- The next safe step is a credentialed Daytona smoke gate plus explicit
+  capability work before enabling Daytona as a resume/fanout snapshot backend.
+
 ## P5: Maintenance Automation
 
 Goal: catch upstream Harbor drift earlier.
 
 - Keep the deterministic parent workflow as the required merge gate.
-- Add an optional scheduled upstream-merge dry run against `origin/main`.
+- Add an optional upstream-merge dry run against `origin/main` that reuses the
+  fixed branch `multiturn/upstream-merge-dry-run`.
 - Keep credentialed Terminus-2 MT@4 and SR tests as release-like validation
   rather than mandatory pull-request CI.
 - Record only stable commands and current expected outputs in docs; do not store
   run logs or credentials.
+
+Automation boundary is documented in `MAINTENANCE_AUTOMATION.md`.

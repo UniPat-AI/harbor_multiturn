@@ -74,6 +74,13 @@ trial/state/snapshot-image.tar
 
 `state/snapshot.*` is the latest successful alias. Resume and roundwise fanout use the concrete `round_N` snapshot as the durable restore point.
 
+Daytona can run Harbor tasks in remote sandboxes and can use Daytona startup
+snapshots, but the current Daytona environment does not implement Harbor's
+per-round state snapshot hook. Use Daytona for credentialed fresh-run smoke
+coverage only until a Daytona-specific per-round snapshot backend is added and
+tested. Resume and roundwise fanout still require an environment that implements
+the Harbor snapshot contract.
+
 ## Unsupported Combinations
 
 The CLI rejects combinations that would make the runtime semantics ambiguous:

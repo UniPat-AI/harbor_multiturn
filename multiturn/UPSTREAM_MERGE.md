@@ -6,11 +6,22 @@ Use these roles consistently:
 
 | Ref | Role |
 | --- | --- |
-| `origin/main` | Upstream Harbor tracking ref. Do not edit directly. |
-| `multi_turn_support` | Original multiturn implementation baseline. Keep as rollback context. |
-| `multiturn/main` | Maintained integration branch for daily work and upstream merges. |
+| `origin/main` | Latest upstream Harbor tracking ref. Treat this as read-only input from Harbor. |
+| `multi_turn_support` | Stable pre-upstream-merge multiturn branch. This is the rollback baseline and the remote default branch for users who need the known-good old multiturn code. |
+| `multiturn/main` | Maintained integration branch for daily work: latest upstream Harbor plus the multiturn overlay. New upstream Harbor releases are merged here. |
+| parent repo `master` | Records the selected `harbor/` submodule commit and owns the `multiturnpp` docs/tests. |
 | `backup/multiturn-main-before-upstream-*` | Per-merge rollback branches. |
 | `backup/multiturn-main-before-upstream-*` tags | Per-merge immutable rollback labels. |
+
+The intended long-term shape is:
+
+```text
+origin/main          # moving upstream Harbor input
+multi_turn_support   # stable multiturn fallback, do not advance during routine upstream syncs
+multiturn/main       # moving integration branch: merge origin/main, repair overlay, test, then update parent gitlink
+```
+
+Use `multiturn/main` for all future Harbor updates. Keep `multi_turn_support` available so a regression in the merged integration branch can be bisected or rolled back without hunting through merge commits.
 
 ## Standard Update
 
@@ -33,6 +44,16 @@ git commit
 ```
 
 If the parent repository records `harbor` as a submodule, update the parent gitlink after the Harbor commit is stable.
+
+Recommended parent-side finish:
+
+```bash
+cd ..
+git add harbor TEST.md tests/
+git commit -m "Update Harbor multiturn integration"
+```
+
+Only stage the submodule gitlink and the multiturn docs/tests you intentionally changed.
 
 ## Conflict Policy
 
@@ -58,6 +79,19 @@ Common conflict zones:
 - Avoid broad formatting rewrites in files that upstream changes frequently.
 - Use merge commits, not rebases, for `multiturn/main`.
 - Separate commits by purpose: upstream merge, local conflict repair, docs/tests.
+- Keep the generated `mleval` fixture under the parent `tests/tasks/` tree, not inside Harbor upstream paths.
+- Prefer adding local multiturn docs under `harbor/multiturn/`; avoid editing upstream documentation unless the upstream project itself changed the contract.
+
+## Recurring Maintenance Checklist
+
+For each upstream Harbor update:
+
+1. Backup `multiturn/main` with a branch and tag before merging.
+2. Merge `origin/main` into `multiturn/main`.
+3. Resolve conflicts by keeping upstream structure first, then reapplying multiturn hooks.
+4. Run `bash tests/run_multiturn_maintenance.sh`.
+5. If agent/session code changed, also run the credentialed Terminus-2 generated-task MT@4/SR commands from `TESTING.md`.
+6. Commit Harbor, update the parent submodule pointer, and commit parent docs/tests.
 
 ## Rollback
 

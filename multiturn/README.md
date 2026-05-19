@@ -18,11 +18,13 @@ The maintained integration branch is `multiturn/main`.
 
 ```text
 origin/main          # upstream Harbor, read-only local tracking ref
-multi_turn_support   # original multiturn implementation baseline, kept as rollback context
+multi_turn_support   # stable pre-merge multiturn baseline and rollback branch
 multiturn/main       # maintained branch: upstream Harbor plus multiturn overlay
 ```
 
 Use merge commits to bring `origin/main` into `multiturn/main`. Do not rebase `multiturn/main`; the merge boundary is useful when auditing which upstream update introduced a conflict or regression.
+
+The parent `multiturnpp` repository records the chosen Harbor commit as the `harbor/` submodule pointer. After `multiturn/main` is stable, update that parent gitlink and commit the matching docs/tests there.
 
 ## Maintenance Loop
 

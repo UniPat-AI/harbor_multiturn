@@ -1,22 +1,23 @@
 # Multiturn Maintenance Testing
 
-## Canonical Three-Round Task
+## Canonical Three-Round Tasks
 
-The continuous regression task is:
+The maintenance gate keeps two local three-round tasks:
 
-```text
-../tests/tasks/theme_d10_w10_ml_ai_mlops_forensics_analysis/
-```
+| Task | Role |
+| --- | --- |
+| `../tests/tasks/theme_d10_w10_ml_ai_mlops_forensics_analysis/` | Compact deterministic task used by the broad Oracle matrix: full run, windows, resume, validation, aggregation, and fanout control flow. |
+| `../tests/tasks/theme_d10_w11_ml_ai_mlops_automation_scripting/` | Clean copy of the generated `mleval` task from `terminal_bench_tasks_multiturn_light_20260515`; used for continuous MT@4 and SR regression on a realistic generated task. |
 
-It has exactly three rounds:
+The generated `mleval` task has exactly three rounds:
 
 | Round | Change type | Purpose |
 | --- | --- | --- |
-| 1 | `extension` | Establish the baseline implementation. |
-| 2 | `correction` | Change prior behavior and verify updated expectations. |
-| 3 | `conflict` | Replace conflicting assumptions and verify the final state. |
+| 1 | `extension` | Establish the `mleval` CLI and registry baseline. |
+| 2 | `extension`, `correction` | Add archive/CSV behavior while changing prior listing semantics. |
+| 3 | `extension`, `conflict` | Add sample statistics/significance behavior and resolve conflicting ranking semantics. |
 
-This task is the fixture for the parent black-box manifest `tests/manifests/multiturn_core.txt`.
+Both tasks are fixtures for the parent black-box manifest `tests/manifests/multiturn_core.txt`.
 
 ## Primary Maintenance Command
 
@@ -29,7 +30,7 @@ bash tests/run_multiturn_maintenance.sh
 The script runs:
 
 1. Harbor unit tests that cover multiturn parsing, resume, snapshots, trajectory merge, agent setup, and selected upstream integration points.
-2. The black-box `multiturn_core` manifest against the three-round task.
+2. The black-box `multiturn_core` manifest against the compact task plus the generated `mleval` MT@4/SR case.
 
 Useful variants:
 
@@ -80,8 +81,58 @@ uv run python -m pytest tests/unit
 - reward aggregation
 - single-chain versus roundwise fanout control flow
 - selected-parent snapshot retention and unselected frontier snapshot pruning
+- generated `mleval` MT@4: `-k 4`, one successful parent continued per round
+- generated `mleval` SR: `--start-round N --max-round N` for rounds 1, 2, and 3
 
 This manifest intentionally uses Oracle so the maintenance loop is deterministic and does not require external model credentials.
+
+To run only the generated task regression:
+
+```bash
+bash tests/run.sh --test 28 --cleanup
+```
+
+## Credentialed Terminus-2 Validation
+
+The deterministic gate above proves Harbor's multiturn plumbing without API credentials. Before release-like updates, run the generated task with the same Terminus-2 shape used during task production.
+
+Use the committed clean fixture so runtime output lands under an ignored `harbor_jobs/` directory:
+
+```bash
+cd /home/shenhaiyang/Source/swebenchpp/multiturnpp
+export TASKS_DIR=/home/shenhaiyang/Source/swebenchpp/multiturnpp/tests/tasks
+export TASK_NAME=theme_d10_w11_ml_ai_mlops_automation_scripting
+```
+
+MT@4:
+
+```bash
+tmux new-session -d -s mt4_${TASK_NAME}_$(date +%Y%m%d) \
+"cd /home/shenhaiyang/Source/swebenchpp/multiturnpp && \
+export TASKS_DIR=/home/shenhaiyang/Source/swebenchpp/multiturnpp/tests/tasks && \
+export TASK_NAME=theme_d10_w11_ml_ai_mlops_automation_scripting && \
+export JOBS_DIR_OVERRIDE=\"\$TASKS_DIR/\$TASK_NAME/harbor_jobs/mt4_opus47_medium_$(date +%Y%m%d)\" && \
+export AGENT_TYPE=terminus-2 AGENT_MODEL=openai/claude-opus-4-7 API_PROVIDER=mindra \
+AGENT_ATTEMPTS=4 HARBOR_N_CONCURRENT=4 \
+MULTIROUND_CONTINUE_SUCCESSES_PER_ROUND=1 AGENT_CONTINUE_SUCCESSES_PER_ROUND=1 \
+TASK_TIMEOUT=43200 && \
+export AGENT_KWARGS='{\"reasoning_effort\":\"medium\"}' && \
+autonomous/lightversion/3_harbor_test_multiple.sh \"\$TASKS_DIR\" agent -t \"\$TASK_NAME\" -j 1 -T 43200 -- --force --agent-continue-successes-per-round 1"
+```
+
+SR for a target round:
+
+```bash
+export JOBS_DIR_OVERRIDE="$TASKS_DIR/$TASK_NAME/harbor_jobs/sr_r3_opus47_medium_$(date +%Y%m%d)"
+export AGENT_TYPE=terminus-2 AGENT_MODEL=openai/claude-opus-4-7 API_PROVIDER=mindra
+export AGENT_ATTEMPTS=4 HARBOR_N_CONCURRENT=4 TASK_TIMEOUT=43200
+export AGENT_KWARGS='{"reasoning_effort":"medium"}'
+
+autonomous/lightversion/3_harbor_test_multiple.sh "$TASKS_DIR" agent -t "$TASK_NAME" -j 1 -T 43200 -- \
+  --force --start-round 3 --max-round 3
+```
+
+Repeat SR with `--start-round 1 --max-round 1`, `--start-round 2 --max-round 2`, and `--start-round 3 --max-round 3`.
 
 ## Merge Gate
 

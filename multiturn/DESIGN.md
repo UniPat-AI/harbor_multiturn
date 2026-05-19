@@ -54,7 +54,7 @@ Default aggregate windows:
 
 - fresh run: executed window
 - in-place resume: round 1 through the new right boundary
-- fanout child: the child trial's responsible window
+- roundwise child: the child trial's responsible window
 
 Explicit `--multiround-aggregate-start-round` and `--multiround-aggregate-end-round` override the default. The resolved window is written to `result.json`.
 
@@ -75,9 +75,12 @@ Resume output modes:
 - `--no-resume-backup` keeps the in-place write behavior but skips the automatic backup
 - `--resume-dry-run` runs the same resolution and preflight path, prints the planned output mode and resume source, and returns before backup, cleanup, or job creation
 
-## Roundwise Fanout
+## Roundwise Multiturn
 
-With `-k > 1`, eligible multiturn jobs can use roundwise attempt selection:
+Eligible local multiturn jobs use roundwise attempt selection, except default
+in-place resume which keeps the original trial writeback contract. `-k 1` is
+the single-branch case; larger `-k` values expand more child attempts per
+selected parent:
 
 - round 1 creates a frontier of attempts
 - successful parents are selected according to `multiround_continue_successes_per_round`

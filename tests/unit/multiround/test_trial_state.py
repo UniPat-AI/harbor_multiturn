@@ -51,6 +51,22 @@ def _write_resume_source_config(source_dir: Path, *, agent_name: str) -> None:
     )
 
 
+def _write_resume_lineage_child_config(
+    child_dir: Path, *, parent_dir: Path, agent_name: str
+) -> None:
+    child_dir.mkdir(parents=True, exist_ok=True)
+    (child_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "task": {"path": "/tmp/task"},
+                "trial_name": child_dir.name,
+                "agent": {"name": agent_name},
+                "verifier": {"multiround_resume_source": str(parent_dir)},
+            }
+        )
+    )
+
+
 def test_build_verifier_failure_message_uses_single_verifier_dir_summary(tmp_path: Path):
     trial_dir = tmp_path / "trial"
     trial_paths = TrialPaths(trial_dir=trial_dir)
@@ -464,6 +480,53 @@ def test_resolve_resume_state_rejects_mismatched_latest_fallback(tmp_path: Path)
         trial._resolve_resume_state()
 
 
+def test_resolve_resume_state_follows_roundwise_parent_lineage(tmp_path: Path):
+    parent_dir = tmp_path / "parent-r1"
+    child_dir = tmp_path / "child-r2"
+    parent_paths = TrialPaths(trial_dir=parent_dir)
+    child_paths = TrialPaths(trial_dir=child_dir)
+    parent_paths.mkdir()
+    child_paths.mkdir()
+
+    _write_snapshot_metadata(
+        parent_paths.round_state_snapshot_path(1),
+        snapshot_id="snap-round-1",
+        image_tag="hbstate__round-1",
+        archive_path=parent_paths.round_state_image_archive_path(1),
+        round_num=1,
+    )
+    _write_snapshot_metadata(
+        child_paths.state_snapshot_path,
+        snapshot_id="snap-round-2",
+        image_tag="hbstate__round-2",
+        archive_path=child_paths.state_image_archive_path,
+        round_num=2,
+    )
+    _write_resume_lineage_child_config(
+        child_dir,
+        parent_dir=parent_dir,
+        agent_name=AgentName.ORACLE.value,
+    )
+
+    trial = object.__new__(SingleStepTrial)
+    trial._logger = logger.getChild("test_trial_multiround_state")
+    trial.config = SimpleNamespace(
+        verifier=SimpleNamespace(
+            multiround_resume_state_image=None,
+            multiround_resume_state_archive=None,
+            multiround_resume_state_snapshot_id=None,
+            multiround_resume_source=str(child_dir),
+            multiround_start_round=2,
+        )
+    )
+
+    image_ref, archive_path, snapshot_id = trial._resolve_resume_state()
+
+    assert image_ref == "hbstate__round-1"
+    assert snapshot_id == "snap-round-1"
+    assert archive_path == str(parent_paths.round_state_image_archive_path(1).resolve())
+
+
 @pytest.mark.asyncio
 async def test_copy_resume_agent_state_prefers_requested_round_session_snapshot(
     tmp_path: Path,
@@ -753,6 +816,41 @@ async def test_copy_resume_agent_state_rejects_mismatched_latest_session_fallbac
         match="No matching Claude session snapshot was found",
     ):
         await trial._copy_resume_agent_state(source_dir, start_round=2)
+
+
+def test_resolve_resume_agent_state_follows_roundwise_parent_lineage(tmp_path: Path):
+    parent_dir = tmp_path / "parent-r1"
+    child_dir = tmp_path / "child-r2"
+    parent_paths = TrialPaths(trial_dir=parent_dir)
+    child_paths = TrialPaths(trial_dir=child_dir)
+    parent_paths.mkdir()
+    child_paths.mkdir()
+
+    session_log = (
+        parent_paths.agent_round_sessions_dir(1) / "projects" / "-app" / "session.jsonl"
+    )
+    session_log.parent.mkdir(parents=True, exist_ok=True)
+    session_log.write_text("round-1-session")
+    runtime_snapshot = parent_paths.terminus_round_runtime_state_path(1)
+    runtime_snapshot.parent.mkdir(parents=True, exist_ok=True)
+    runtime_snapshot.write_text(json.dumps({"round": 1, "chat_messages": []}))
+    _write_resume_lineage_child_config(
+        child_dir,
+        parent_dir=parent_dir,
+        agent_name=AgentName.CLAUDE_CODE.value,
+    )
+
+    trial = object.__new__(SingleStepTrial)
+    trial._logger = logger.getChild("test_trial_multiround_state")
+
+    assert trial._resolve_resume_claude_sessions_dir(
+        child_dir,
+        start_round=2,
+    ) == parent_paths.agent_round_sessions_dir(1)
+    assert trial._resolve_resume_terminus_runtime_state_path(
+        child_dir,
+        start_round=2,
+    ) == runtime_snapshot
 
 
 @pytest.mark.asyncio

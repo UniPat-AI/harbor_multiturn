@@ -656,10 +656,10 @@ class Job:
             await self._write_job_result_async(exclude_trial_results=True)
 
     def _is_multiround_attempt_selection_enabled(self) -> bool:
-        """Whether to enable round-wise attempt expansion for multi-round tasks."""
-        if self.config.n_attempts <= 1:
-            return False
+        """Whether to run local multi-round tasks through round-wise orchestration."""
         if self.is_resuming or self._existing_trial_results:
+            return False
+        if self.config.verifier.multiround_resume_trial_name is not None:
             return False
         if not self._remaining_trial_configs:
             return False

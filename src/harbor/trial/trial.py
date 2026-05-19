@@ -324,51 +324,93 @@ class Trial(ABC):
             ),
         }
 
+    def _iter_resume_lineage_trial_dirs(self, source_trial_dir: Path):
+        seen: set[Path] = set()
+        current = source_trial_dir.expanduser()
+
+        while True:
+            try:
+                resolved = current.resolve()
+            except OSError:
+                resolved = current.absolute()
+            if resolved in seen:
+                return
+
+            seen.add(resolved)
+            yield current
+
+            config_path = current / "config.json"
+            if not config_path.exists():
+                return
+            try:
+                payload = json.loads(config_path.read_text())
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to read resume lineage config from %s: %s",
+                    config_path,
+                    exc,
+                )
+                return
+
+            verifier = payload.get("verifier")
+            if not isinstance(verifier, dict):
+                return
+            parent = verifier.get("multiround_resume_source")
+            if not isinstance(parent, str) or not parent.strip():
+                return
+            current = Path(parent).expanduser()
+
     def _resolve_resume_snapshot_metadata_path(
         self, resume_source: Path
     ) -> Path | None:
-        source_paths = TrialPaths(trial_dir=resume_source)
         start_round = self.config.verifier.multiround_start_round or 1
         completed_round = start_round - 1
 
-        if completed_round >= 1:
-            round_snapshot_path = source_paths.round_state_snapshot_path(completed_round)
-            if round_snapshot_path.exists():
-                return round_snapshot_path
+        for candidate_dir in self._iter_resume_lineage_trial_dirs(resume_source):
+            source_paths = TrialPaths(trial_dir=candidate_dir)
+
+            if completed_round >= 1:
+                round_snapshot_path = source_paths.round_state_snapshot_path(
+                    completed_round
+                )
+                if round_snapshot_path.exists():
+                    return round_snapshot_path
+
+                latest_snapshot_path = source_paths.state_snapshot_path
+                if latest_snapshot_path.exists():
+                    try:
+                        latest_snapshot_payload = json.loads(
+                            latest_snapshot_path.read_text()
+                        )
+                    except Exception:
+                        latest_snapshot_payload = {}
+
+                    latest_round = latest_snapshot_payload.get("round")
+                    if latest_round not in (None, completed_round):
+                        self.logger.warning(
+                            "Requested resume source %s at round %s, but top-level "
+                            "latest snapshot %s points to round %s; checking parent "
+                            "resume lineage if present",
+                            candidate_dir,
+                            completed_round,
+                            latest_snapshot_path,
+                            latest_round,
+                        )
+                        continue
+
+                    self.logger.warning(
+                        "Round-specific snapshot metadata missing for resume source %s "
+                        "at round %s; falling back to latest snapshot metadata %s",
+                        candidate_dir,
+                        completed_round,
+                        latest_snapshot_path,
+                    )
+                    return latest_snapshot_path
+                continue
 
             latest_snapshot_path = source_paths.state_snapshot_path
             if latest_snapshot_path.exists():
-                try:
-                    latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
-                except Exception:
-                    latest_snapshot_payload = {}
-
-                latest_round = latest_snapshot_payload.get("round")
-                if latest_round not in (None, completed_round):
-                    self.logger.warning(
-                        "Requested resume source %s at round %s, but top-level latest "
-                        "snapshot %s points to round %s; refusing fallback to avoid "
-                        "restoring the wrong state",
-                        resume_source,
-                        completed_round,
-                        latest_snapshot_path,
-                        latest_round,
-                    )
-                    return None
-
-                self.logger.warning(
-                    "Round-specific snapshot metadata missing for resume source %s "
-                    "at round %s; falling back to latest snapshot metadata %s",
-                    resume_source,
-                    completed_round,
-                    latest_snapshot_path,
-                )
                 return latest_snapshot_path
-            return None
-
-        latest_snapshot_path = source_paths.state_snapshot_path
-        if latest_snapshot_path.exists():
-            return latest_snapshot_path
         return None
 
     def _resolve_resume_source_latest_round(self, source_trial_dir: Path) -> int | None:

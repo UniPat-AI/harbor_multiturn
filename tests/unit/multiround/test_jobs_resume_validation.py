@@ -7,6 +7,9 @@ import pytest
 from harbor.cli.jobs import (
     _cleanup_trial_for_resume,
     _compute_task_definition_checksum,
+    _resolve_resume_claude_sessions_dir,
+    _resolve_resume_snapshot_metadata_path,
+    _resolve_resume_terminus_runtime_state_path,
     _resolve_resume_trial_dir,
     _would_enable_roundwise_multiround_attempt_selection,
     start,
@@ -123,6 +126,23 @@ def _write_claude_round_session_snapshot(trial_dir: Path, *, round_num: int) -> 
     )
     session_log.parent.mkdir(parents=True, exist_ok=True)
     session_log.write_text(f"round-{round_num}-session")
+
+
+def _write_roundwise_child_config(
+    trial_dir: Path,
+    *,
+    parent_trial_dir: Path,
+    source_agent_name: str,
+    task_path: Path,
+) -> None:
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    config = TrialConfig(
+        task=TaskConfig(path=task_path),
+        trial_name=trial_dir.name,
+        agent=AgentConfig(name=source_agent_name),
+    )
+    config.verifier.multiround_resume_source = str(parent_trial_dir)
+    (trial_dir / "config.json").write_text(config.model_dump_json(indent=2))
 
 
 def _write_task(task_dir: Path) -> None:
@@ -329,7 +349,7 @@ def test_cleanup_trial_for_resume_preserves_earlier_oracle_logs_and_clears_excep
     assert not trial_paths.exception_message_path.exists()
 
 
-def test_validate_resume_shape_requires_single_agent_and_single_attempt():
+def test_validate_resume_shape_requires_single_agent_and_allows_attempt_count():
     config = JobConfig()
     config.agents = [AgentConfig(name="oracle"), AgentConfig(name="claude-code")]
     with pytest.raises(ValueError, match="exactly one agent"):
@@ -452,6 +472,65 @@ def test_resolve_resume_trial_dir_preserves_explicit_trial_dir(tmp_path: Path):
     resolved = _resolve_resume_trial_dir(trial_dir, start_round=3)
 
     assert resolved == trial_dir.resolve()
+
+
+def test_resume_snapshot_resolution_follows_roundwise_parent_lineage(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    parent_trial = tmp_path / "parent-r1"
+    child_trial = tmp_path / "child-r2"
+    _write_source_trial_config(
+        parent_trial,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_round_snapshot_metadata(parent_trial, round_num=1)
+    _write_roundwise_child_config(
+        child_trial,
+        parent_trial_dir=parent_trial,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_latest_snapshot_metadata(child_trial, round_num=2)
+
+    resolved = _resolve_resume_snapshot_metadata_path(child_trial, start_round=2)
+
+    assert resolved == TrialPaths(parent_trial).round_state_snapshot_path(1)
+
+
+def test_resume_agent_state_resolution_follows_roundwise_parent_lineage(
+    tmp_path: Path,
+):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    parent_trial = tmp_path / "parent-r1"
+    child_trial = tmp_path / "child-r2"
+    _write_source_trial_config(
+        parent_trial,
+        source_agent_name="claude-code",
+        task_path=task_dir,
+    )
+    _write_claude_round_session_snapshot(parent_trial, round_num=1)
+    terminus_state = TrialPaths(parent_trial).terminus_round_runtime_state_path(1)
+    terminus_state.parent.mkdir(parents=True, exist_ok=True)
+    terminus_state.write_text(json.dumps({"round": 1}))
+    _write_roundwise_child_config(
+        child_trial,
+        parent_trial_dir=parent_trial,
+        source_agent_name="claude-code",
+        task_path=task_dir,
+    )
+
+    assert _resolve_resume_claude_sessions_dir(
+        child_trial,
+        start_round=2,
+    ) == TrialPaths(parent_trial).agent_round_sessions_dir(1)
+    assert _resolve_resume_terminus_runtime_state_path(
+        child_trial,
+        start_round=2,
+    ) == terminus_state
 
 
 def test_start_accepts_resume_job_dir_and_uses_selected_child(tmp_path: Path):
@@ -995,18 +1074,17 @@ def test_start_strict_resume_preflight_requires_agent_state(tmp_path: Path):
         )
 
 
-def test_start_rejects_fanout_with_cache_policy_off(tmp_path: Path):
+def test_start_rejects_multiround_roundwise_with_cache_policy_off(tmp_path: Path):
     task_dir = tmp_path / "task"
     _write_multiround_task(task_dir)
 
     with pytest.raises(
         ValueError,
-        match="--n-attempts > 1 with --multiround-state-cache-policy off",
+        match="Multi-round round-wise execution with --multiround-state-cache-policy off",
     ):
         start(
             path=task_dir,
             agent_name="oracle",
-            n_attempts=4,
             multiround_state_cache_policy="off",
         )
 
@@ -1069,6 +1147,37 @@ def test_resume_source_with_multiple_attempts_enables_roundwise_attempt_selectio
     config.verifier.multiround_start_round = 3
     config.verifier.multiround_resume_source = str(
         tmp_path / "source-task__abc1234__mr-r2-a0"
+    )
+
+    assert _would_enable_roundwise_multiround_attempt_selection(config) is True
+
+
+def test_inplace_resume_keeps_single_trial_execution_path(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir)
+
+    config = JobConfig(
+        jobs_dir=tmp_path / "jobs",
+        job_name="resume-in-place",
+        n_attempts=1,
+        tasks=[TaskConfig(path=task_dir)],
+    )
+    config.verifier.multiround_start_round = 2
+    config.verifier.multiround_resume_source = str(tmp_path / "source-backup")
+    config.verifier.multiround_resume_trial_name = "source-trial"
+
+    assert _would_enable_roundwise_multiround_attempt_selection(config) is False
+
+
+def test_single_attempt_multiround_enables_roundwise_attempt_selection(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir)
+
+    config = JobConfig(
+        jobs_dir=tmp_path / "jobs",
+        job_name="mt1",
+        n_attempts=1,
+        tasks=[TaskConfig(path=task_dir)],
     )
 
     assert _would_enable_roundwise_multiround_attempt_selection(config) is True

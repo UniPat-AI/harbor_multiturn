@@ -761,67 +761,105 @@ def _resolve_resume_source_latest_round(resume_trial_dir: Path) -> int | None:
     return max(rounds) if rounds else None
 
 
+def _iter_resume_lineage_trial_dirs(resume_trial_dir: Path):
+    seen: set[Path] = set()
+    current = resume_trial_dir.expanduser()
+
+    while True:
+        try:
+            resolved = current.resolve()
+        except OSError:
+            resolved = current.absolute()
+        if resolved in seen:
+            return
+
+        seen.add(resolved)
+        yield current
+
+        config_path = current / "config.json"
+        if not config_path.exists():
+            return
+        try:
+            payload = json.loads(config_path.read_text())
+        except Exception:
+            return
+
+        verifier = payload.get("verifier")
+        if not isinstance(verifier, dict):
+            return
+        parent = verifier.get("multiround_resume_source")
+        if not isinstance(parent, str) or not parent.strip():
+            return
+        current = Path(parent).expanduser()
+
+
 def _resolve_resume_snapshot_metadata_path(
     resume_trial_dir: Path, *, start_round: int
 ) -> Path | None:
-    trial_paths = TrialPaths(resume_trial_dir)
     completed_round = start_round - 1
 
-    if completed_round >= 1:
-        round_snapshot_path = trial_paths.round_state_snapshot_path(completed_round)
-        if round_snapshot_path.exists():
-            return round_snapshot_path
+    for candidate_dir in _iter_resume_lineage_trial_dirs(resume_trial_dir):
+        trial_paths = TrialPaths(candidate_dir)
+
+        if completed_round >= 1:
+            round_snapshot_path = trial_paths.round_state_snapshot_path(completed_round)
+            if round_snapshot_path.exists():
+                return round_snapshot_path
+
+            latest_snapshot_path = trial_paths.state_snapshot_path
+            if latest_snapshot_path.exists():
+                try:
+                    latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
+                except Exception:
+                    latest_snapshot_payload = {}
+                latest_round = latest_snapshot_payload.get("round")
+                if latest_round in (None, completed_round):
+                    return latest_snapshot_path
+            continue
 
         latest_snapshot_path = trial_paths.state_snapshot_path
         if latest_snapshot_path.exists():
-            try:
-                latest_snapshot_payload = json.loads(latest_snapshot_path.read_text())
-            except Exception:
-                latest_snapshot_payload = {}
-            latest_round = latest_snapshot_payload.get("round")
-            if latest_round in (None, completed_round):
-                return latest_snapshot_path
-        return None
-
-    latest_snapshot_path = trial_paths.state_snapshot_path
-    if latest_snapshot_path.exists():
-        return latest_snapshot_path
+            return latest_snapshot_path
     return None
 
 
 def _resolve_resume_claude_sessions_dir(
     resume_trial_dir: Path, *, start_round: int
 ) -> Path | None:
-    trial_paths = TrialPaths(resume_trial_dir)
     completed_round = start_round - 1
     if completed_round < 1:
         return None
 
-    round_sessions_dir = trial_paths.agent_round_sessions_dir(completed_round)
-    if round_sessions_dir.exists():
-        return round_sessions_dir
+    for candidate_dir in _iter_resume_lineage_trial_dirs(resume_trial_dir):
+        trial_paths = TrialPaths(candidate_dir)
+        round_sessions_dir = trial_paths.agent_round_sessions_dir(completed_round)
+        if round_sessions_dir.exists():
+            return round_sessions_dir
 
-    latest_sessions_dir = trial_paths.agent_sessions_dir
-    if not latest_sessions_dir.exists():
-        return None
+        latest_sessions_dir = trial_paths.agent_sessions_dir
+        if not latest_sessions_dir.exists():
+            continue
 
-    latest_round = _resolve_resume_source_latest_round(resume_trial_dir)
-    if latest_round != completed_round:
-        return None
-    return latest_sessions_dir
+        latest_round = _resolve_resume_source_latest_round(candidate_dir)
+        if latest_round == completed_round:
+            return latest_sessions_dir
+    return None
 
 
 def _resolve_resume_terminus_runtime_state_path(
     resume_trial_dir: Path, *, start_round: int
 ) -> Path | None:
-    trial_paths = TrialPaths(resume_trial_dir)
     completed_round = start_round - 1
     if completed_round < 1:
         return None
 
-    round_state_path = trial_paths.terminus_round_runtime_state_path(completed_round)
-    if round_state_path.exists():
-        return round_state_path
+    for candidate_dir in _iter_resume_lineage_trial_dirs(resume_trial_dir):
+        trial_paths = TrialPaths(candidate_dir)
+        round_state_path = trial_paths.terminus_round_runtime_state_path(
+            completed_round
+        )
+        if round_state_path.exists():
+            return round_state_path
     return None
 
 
@@ -1016,9 +1054,9 @@ def _print_multiround_resume_dry_run_report(
 
 
 def _would_enable_roundwise_multiround_attempt_selection(config: JobConfig) -> bool:
-    if config.n_attempts <= 1:
-        return False
     if (config.jobs_dir / config.job_name / "result.json").exists():
+        return False
+    if config.verifier.multiround_resume_trial_name is not None:
         return False
 
     task_configs = list(config.tasks)
@@ -1774,8 +1812,8 @@ def start(
         int | None,
         Option(
             "--multiround-continue-successes-per-round",
-            help="In multi-round mode with --n-attempts > 1, number of successful "
-            "trajectories selected per round to continue to the next round.",
+            help="In multi-round mode, number of successful parent trajectories "
+            "selected per round to continue to the next round.",
             rich_help_panel="Multi-round",
             show_default=False,
         ),
@@ -2409,10 +2447,9 @@ def start(
         and _would_enable_roundwise_multiround_attempt_selection(config)
     ):
         raise ValueError(
-            "-k/--n-attempts > 1 with --multiround-state-cache-policy off "
-            "is only unsupported when round-wise multi-round attempt selection "
-            "would be enabled: fanout child trials require parent snapshots "
-            "which are never saved under policy 'off'. "
+            "Multi-round round-wise execution with --multiround-state-cache-policy off "
+            "is unsupported: child trials require parent snapshots which are never "
+            "saved under policy 'off'. "
             "Use 'success' (default) or 'all' instead."
         )
 

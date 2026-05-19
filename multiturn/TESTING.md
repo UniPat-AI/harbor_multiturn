@@ -87,7 +87,7 @@ uv run python -m pytest tests/unit
 - unsupported-agent preflight
 - CLI parameter validation
 - reward aggregation
-- single-chain versus roundwise fanout control flow
+- `-k 1` and `-k 4` roundwise control flow
 - selected-parent snapshot retention and unselected frontier snapshot pruning
 - generated `mleval` MT@4: `-k 4`, one successful parent continued per round
 - generated `mleval` SR: `--start-round N --max-round N` for rounds 1, 2, and 3
@@ -124,7 +124,7 @@ bash tests/check_daytona_multiturn_env.sh
 ```
 
 Daytona currently validates fresh-run plumbing. Do not treat it as equivalent
-to Docker for resume/fanout snapshot coverage until `DaytonaEnvironment`
+to Docker for resume / roundwise snapshot coverage until `DaytonaEnvironment`
 implements Harbor's per-round `capture_state_snapshot()` contract.
 
 MT@4:

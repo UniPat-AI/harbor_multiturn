@@ -44,7 +44,7 @@ Responsibilities:
 
 - Validate that multiturn tasks use agents with explicit round support.
 - Use upstream `TrialQueue` scheduling for normal jobs.
-- Switch eligible `-k > 1` multiturn runs into roundwise frontier/child expansion.
+- Switch eligible local multiturn runs into roundwise frontier/child expansion; default in-place resume stays on the single-trial writeback path.
 - Pass parent snapshot and lineage metadata into child trial configs.
 
 ## Trial Lifecycle

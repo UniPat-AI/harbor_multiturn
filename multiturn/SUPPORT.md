@@ -94,6 +94,6 @@ The CLI rejects combinations that would make the runtime semantics ambiguous:
 - `--output-jobs-dir` without `--resume-trial`
 - `--start-round > --max-round`
 - `--resume-trial` on dataset or multi-task jobs
-- roundwise fanout that requires snapshots while `multiround_state_cache_policy=off`
+- roundwise child expansion that requires snapshots while `multiround_state_cache_policy=off`
 
 Cross-agent resume is intentionally narrow. Oracle-to-agent handoff is supported for the tested paths; non-Oracle cross-agent handoff must pass the current CLI validation and resume preflight checks.

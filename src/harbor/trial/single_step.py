@@ -521,56 +521,59 @@ class SingleStepTrial(Trial):
     def _resolve_resume_claude_sessions_dir(
         self, source_trial_dir: Path, start_round: int
     ) -> Path | None:
-        source_paths = TrialPaths(trial_dir=source_trial_dir)
         completed_round = start_round - 1
 
         if completed_round < 1:
             return None
 
-        round_sessions_dir = source_paths.agent_round_sessions_dir(completed_round)
-        if round_sessions_dir.exists():
-            return round_sessions_dir
+        for candidate_dir in self._iter_resume_lineage_trial_dirs(source_trial_dir):
+            source_paths = TrialPaths(trial_dir=candidate_dir)
+            round_sessions_dir = source_paths.agent_round_sessions_dir(completed_round)
+            if round_sessions_dir.exists():
+                return round_sessions_dir
 
-        latest_sessions_dir = source_paths.agent_sessions_dir
-        if not latest_sessions_dir.exists():
-            return None
+            latest_sessions_dir = source_paths.agent_sessions_dir
+            if not latest_sessions_dir.exists():
+                continue
 
-        latest_round = self._resolve_resume_source_latest_round(source_trial_dir)
-        if latest_round != completed_round:
+            latest_round = self._resolve_resume_source_latest_round(candidate_dir)
+            if latest_round != completed_round:
+                self.logger.warning(
+                    "Requested Claude resume source %s at round %s, but the latest "
+                    "available agent/session state corresponds to round %s; checking "
+                    "parent resume lineage if present",
+                    candidate_dir,
+                    completed_round,
+                    latest_round,
+                )
+                continue
+
             self.logger.warning(
-                "Requested Claude resume source %s at round %s, but the latest "
-                "available agent/session state corresponds to round %s; refusing "
-                "fallback to top-level sessions to avoid restoring a future round",
-                source_trial_dir,
+                "Round-specific Claude session snapshot missing for resume source %s "
+                "at round %s; falling back to top-level sessions %s because the source "
+                "trial's latest round is also %s",
+                candidate_dir,
                 completed_round,
+                latest_sessions_dir,
                 latest_round,
             )
-            return None
-
-        self.logger.warning(
-            "Round-specific Claude session snapshot missing for resume source %s "
-            "at round %s; falling back to top-level sessions %s because the source "
-            "trial's latest round is also %s",
-            source_trial_dir,
-            completed_round,
-            latest_sessions_dir,
-            latest_round,
-        )
-        return latest_sessions_dir
+            return latest_sessions_dir
+        return None
 
     def _resolve_resume_terminus_runtime_state_path(
         self, source_trial_dir: Path, start_round: int
     ) -> Path | None:
-        source_paths = TrialPaths(trial_dir=source_trial_dir)
         completed_round = start_round - 1
         if completed_round < 1:
             return None
 
-        round_state_path = source_paths.terminus_round_runtime_state_path(
-            completed_round
-        )
-        if round_state_path.exists():
-            return round_state_path
+        for candidate_dir in self._iter_resume_lineage_trial_dirs(source_trial_dir):
+            source_paths = TrialPaths(trial_dir=candidate_dir)
+            round_state_path = source_paths.terminus_round_runtime_state_path(
+                completed_round
+            )
+            if round_state_path.exists():
+                return round_state_path
         return None
 
     async def _copy_resume_agent_state(

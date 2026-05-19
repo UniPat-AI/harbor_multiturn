@@ -96,6 +96,48 @@ async def test_roundwise_multiround_child_names_use_parent_attempt_idx(
 
 
 @pytest.mark.asyncio
+async def test_roundwise_multiround_single_attempt_uses_same_frontier_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(
+        job_module,
+        "Task",
+        lambda path: SimpleNamespace(name=path.name, num_rounds=2),
+    )
+
+    job = object.__new__(Job)
+    job.config = JobConfig(n_attempts=1)
+    job.config.verifier.multiround_continue_successes_per_round = 1
+    job._remaining_trial_configs = [
+        TrialConfig(task=TaskConfig(path=tmp_path / "demo-task"))
+    ]
+    job._logger = job_module.logger.getChild("test_job_multiround_single_attempt")
+
+    captured_frontiers: list[list[TrialConfig]] = []
+
+    async def fake_run_trial_batch(frontier: list[TrialConfig]) -> list[TrialResult]:
+        captured_frontiers.append(frontier)
+        round_num = len(captured_frontiers)
+        parent_dir = tmp_path / f"round-{round_num}-trial"
+        parent_dir.mkdir()
+        return [_make_trial_result(frontier[0], parent_dir, round_num=round_num)]
+
+    job._run_trial_batch = fake_run_trial_batch
+
+    await job._run_roundwise_multiround_attempt_selection()
+
+    assert len(captured_frontiers) == 2
+    assert len(captured_frontiers[0]) == 1
+    assert len(captured_frontiers[1]) == 1
+    assert "__mr-r1-a0" in captured_frontiers[0][0].trial_name
+    assert "__mr-r2-p0-" in captured_frontiers[1][0].trial_name
+    assert captured_frontiers[1][0].trial_name.endswith("-a0")
+    assert captured_frontiers[1][0].verifier.multiround_start_round == 2
+    assert captured_frontiers[1][0].verifier.multiround_max_round == 2
+    assert captured_frontiers[1][0].verifier.multiround_resume_source is not None
+
+
+@pytest.mark.asyncio
 async def test_roundwise_multiround_resume_frontier_uses_resume_parent_segment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

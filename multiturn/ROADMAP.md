@@ -123,7 +123,7 @@ Current Daytona position:
   startup snapshots.
 - Daytona-backed fresh multiturn runs use the normal Harbor remote environment
   path.
-- Daytona-backed resume/fanout becomes a supported path when the Daytona
+- Daytona-backed resume / roundwise becomes a supported path when the Daytona
   adapter advertises Harbor-compatible round snapshot capture/restore metadata.
 - The current maintenance gate includes local Daytona preflight; the next
   capability step is a credentialed smoke gate that records the adapter

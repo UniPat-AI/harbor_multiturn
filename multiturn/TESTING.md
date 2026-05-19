@@ -32,6 +32,8 @@ The script runs:
 1. Harbor unit tests that cover multiturn parsing, resume, snapshots, trajectory merge, agent setup, and selected upstream integration points.
 2. The black-box `multiturn_core` manifest against the compact task plus the generated `mleval` MT@4/SR case.
 
+The parent repository also carries `.github/workflows/multiturn-maintenance.yml`, which runs the unit gate and the deterministic black-box gate when `multiturnpp/**` changes. The local multiturn gate is intentionally kept out of Harbor's upstream `.github/workflows` so future upstream merges do not create workflow conflicts.
+
 Useful variants:
 
 ```bash
@@ -48,6 +50,7 @@ The maintenance script runs:
 
 ```text
 harbor/tests/unit/multiround/
+harbor/tests/unit/cli/
 harbor/tests/unit/test_task_relative_path.py
 harbor/tests/unit/models/test_job_lock.py
 harbor/tests/unit/environments/test_docker.py
@@ -55,6 +58,8 @@ harbor/tests/unit/agents/installed/test_claude_code_resume_context.py
 harbor/tests/unit/agents/installed/test_setup_retry.py
 harbor/tests/unit/agents/terminus_2/test_resume_context_equivalence.py
 harbor/tests/unit/agents/terminus_2/test_session_recovery.py
+harbor/tests/unit/agents/terminus_2/test_terminus_2_mcp.py
+harbor/tests/unit/agents/terminus_2/test_terminus_2_temperature.py
 harbor/tests/unit/agents/terminus_2/test_tmux_current_path.py
 harbor/tests/unit/agents/terminus_2/test_tmux_recording_fallback.py
 harbor/tests/unit/agents/terminus_2/test_tmux_session.py

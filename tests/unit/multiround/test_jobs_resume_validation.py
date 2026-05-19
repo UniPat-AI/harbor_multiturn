@@ -576,6 +576,75 @@ def test_start_in_place_resume_removes_stale_job_lock(tmp_path: Path):
     assert captured["lock_exists_at_run"] is False
 
 
+def test_start_no_resume_backup_resumes_from_cleaned_source_trial(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    job_dir = tmp_path / "2026-04-07__12-00-00"
+    job_dir.mkdir()
+
+    selected_trial = job_dir / "selected-trial"
+    trial_paths = TrialPaths(trial_dir=selected_trial)
+    trial_paths.mkdir()
+    _write_source_trial_config(
+        selected_trial,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_multiround_source_trial_result(
+        selected_trial,
+        completed_round=1,
+        reward=1.0,
+    )
+    _write_round_snapshot_metadata(selected_trial, round_num=1)
+    _write_round_snapshot_metadata(selected_trial, round_num=2)
+
+    multiround_results = selected_trial / "verifier" / "multiround_results.json"
+    multiround_results.write_text('{"rounds": []}\n')
+    stale_round_reward = selected_trial / "verifier" / "round_2_reward.txt"
+    stale_round_reward.write_text("1\n")
+
+    import harbor.cli.jobs as jobs_module
+    import harbor.job as job_module
+
+    captured = {}
+
+    async def fake_run(self):
+        captured["resume_source"] = self.config.verifier.multiround_resume_source
+        captured["resume_trial_name"] = (
+            self.config.verifier.multiround_resume_trial_name
+        )
+        return SimpleNamespace(stats=SimpleNamespace(evals={}))
+
+    original_job_run = job_module.Job.run
+    original_show_hint = jobs_module.show_registry_hint_if_first_run
+    original_print_tables = jobs_module.print_job_results_tables
+
+    job_module.Job.run = fake_run
+    jobs_module.show_registry_hint_if_first_run = lambda console: None
+    jobs_module.print_job_results_tables = lambda _: None
+    try:
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_trial=selected_trial,
+            resume_round=2,
+            no_resume_backup=True,
+        )
+    finally:
+        job_module.Job.run = original_job_run
+        jobs_module.show_registry_hint_if_first_run = original_show_hint
+        jobs_module.print_job_results_tables = original_print_tables
+
+    assert captured["resume_source"] == str(selected_trial.resolve())
+    assert captured["resume_trial_name"] == selected_trial.name
+    assert not list(job_dir.glob("selected-trial__resumed_*"))
+    assert trial_paths.round_state_snapshot_path(1).exists()
+    assert not trial_paths.round_state_snapshot_path(2).exists()
+    assert not stale_round_reward.exists()
+    assert multiround_results.read_text() == '{"rounds": []}\n'
+
+
 def test_start_accepts_resume_job_dir_and_uses_selected_child_for_claude(
     tmp_path: Path,
 ):

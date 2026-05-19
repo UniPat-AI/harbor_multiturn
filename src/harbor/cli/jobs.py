@@ -1890,11 +1890,27 @@ def start(
             show_default=False,
         ),
     ] = None,
+    resume_mode: Annotated[
+        str | None,
+        Option(
+            "--resume-mode",
+            help=(
+                "Explicit resume output mode: inplace-backup, copy, or "
+                "inplace-no-backup. Existing --output-jobs-dir and "
+                "--no-resume-backup remain supported."
+            ),
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = None,
     no_resume_backup: Annotated[
         bool,
         Option(
             "--no-resume-backup",
-            help="Skip creating __resumed_<timestamp> backup dirs for in-place resume.",
+            help=(
+                "Legacy spelling for --resume-mode inplace-no-backup; skip creating "
+                "__resumed_<timestamp> backup dirs for in-place resume."
+            ),
             rich_help_panel="Multi-round",
             show_default=False,
         ),
@@ -1903,7 +1919,10 @@ def start(
         Path | None,
         Option(
             "--output-jobs-dir",
-            help="Write resume output to this jobs directory instead of modifying the source trial.",
+            help=(
+                "Write resume output to this jobs directory instead of modifying the "
+                "source trial; equivalent to --resume-mode copy plus this output path."
+            ),
             rich_help_panel="Multi-round",
             show_default=False,
         ),
@@ -2338,6 +2357,8 @@ def start(
 
     if output_jobs_dir is not None and pending_resume is None:
         raise ValueError("--output-jobs-dir requires --resume-trial")
+    if resume_mode is not None and pending_resume is None:
+        raise ValueError("--resume-mode requires --resume-trial")
     if resume_dry_run and pending_resume is None:
         raise ValueError("--resume-dry-run requires --resume-trial")
 
@@ -2393,6 +2414,7 @@ def start(
             jobs_dir=jobs_dir,
             output_jobs_dir=output_jobs_dir,
             no_resume_backup=no_resume_backup,
+            resume_mode=resume_mode,
         )
 
         config.jobs_dir = resume_plan.jobs_dir

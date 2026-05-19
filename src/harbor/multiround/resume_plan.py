@@ -11,6 +11,12 @@ class ResumeOutputMode(str, Enum):
     IN_PLACE_WITHOUT_BACKUP = "in_place_without_backup"
 
 
+class ResumeMode(str, Enum):
+    INPLACE_BACKUP = "inplace-backup"
+    COPY = "copy"
+    INPLACE_NO_BACKUP = "inplace-no-backup"
+
+
 @dataclass(frozen=True)
 class ResumeOutputPlan:
     output_mode: ResumeOutputMode
@@ -44,11 +50,45 @@ def plan_resume_output(
     jobs_dir: Path | None,
     output_jobs_dir: Path | None,
     no_resume_backup: bool,
+    resume_mode: ResumeMode | str | None = None,
 ) -> ResumeOutputPlan:
     trial_parent = resolved_resume.parent
     inferred_jobs_dir = trial_parent.parent
     inferred_job_name = trial_parent.name
     resume_trial_name = resolved_resume.name
+
+    if isinstance(resume_mode, str):
+        try:
+            resume_mode = ResumeMode(resume_mode)
+        except ValueError as exc:
+            allowed = ", ".join(mode.value for mode in ResumeMode)
+            raise ValueError(
+                f"--resume-mode must be one of: {allowed}"
+            ) from exc
+
+    if resume_mode == ResumeMode.COPY:
+        if output_jobs_dir is None:
+            raise ValueError(
+                "--resume-mode copy requires --output-jobs-dir; "
+                "-o/--jobs-dir does not select copy-mode output"
+            )
+        if no_resume_backup:
+            raise ValueError("--resume-mode copy conflicts with --no-resume-backup")
+
+    if resume_mode == ResumeMode.INPLACE_BACKUP:
+        if output_jobs_dir is not None:
+            raise ValueError(
+                "--resume-mode inplace-backup conflicts with --output-jobs-dir"
+            )
+        if no_resume_backup:
+            raise ValueError(
+                "--resume-mode inplace-backup conflicts with --no-resume-backup"
+            )
+
+    if resume_mode == ResumeMode.INPLACE_NO_BACKUP and output_jobs_dir is not None:
+        raise ValueError(
+            "--resume-mode inplace-no-backup conflicts with --output-jobs-dir"
+        )
 
     if output_jobs_dir is not None:
         return ResumeOutputPlan(
@@ -70,7 +110,7 @@ def plan_resume_output(
     return ResumeOutputPlan(
         output_mode=(
             ResumeOutputMode.IN_PLACE_WITHOUT_BACKUP
-            if no_resume_backup
+            if no_resume_backup or resume_mode == ResumeMode.INPLACE_NO_BACKUP
             else ResumeOutputMode.IN_PLACE_WITH_BACKUP
         ),
         jobs_dir=inferred_jobs_dir,

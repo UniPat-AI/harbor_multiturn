@@ -30,6 +30,7 @@ Responsibilities:
 - Expose round window, resume, aggregate window, state cache, and fanout parameters.
 - Reject invalid multiturn combinations before jobs start.
 - Plan resume output mode, inferred jobs directory, job name, and backup naming without filesystem side effects.
+- Accept explicit `--resume-mode` while preserving legacy `--output-jobs-dir` and `--no-resume-backup` spellings.
 - Print the resume dry-run report before any backup, cleanup, or job creation.
 - Resolve in-place resume targets and snapshot source metadata.
 - Persist multiturn parameters to `config.json`.

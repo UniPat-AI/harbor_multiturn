@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from harbor.multiround.resume_plan import (
+    ResumeMode,
     ResumeOutputMode,
     plan_resume_output,
 )
@@ -26,6 +27,36 @@ def test_plan_resume_output_copies_to_explicit_output_jobs_dir(tmp_path: Path):
     assert plan.resume_trial_name_for_config is None
     assert plan.mutates_source_trial is False
     assert plan.uses_backup is False
+
+
+def test_plan_resume_output_copy_mode_requires_output_jobs_dir(tmp_path: Path):
+    resume_trial = tmp_path / "jobs" / "demo-job" / "trial-a"
+
+    with pytest.raises(ValueError, match="--resume-mode copy requires --output-jobs-dir"):
+        plan_resume_output(
+            resolved_resume=resume_trial,
+            jobs_dir=None,
+            output_jobs_dir=None,
+            no_resume_backup=False,
+            resume_mode=ResumeMode.COPY,
+        )
+
+
+def test_plan_resume_output_explicit_copy_mode(tmp_path: Path):
+    resume_trial = tmp_path / "jobs" / "demo-job" / "trial-a"
+    output_jobs_dir = tmp_path / "new-jobs"
+
+    plan = plan_resume_output(
+        resolved_resume=resume_trial,
+        jobs_dir=None,
+        output_jobs_dir=output_jobs_dir,
+        no_resume_backup=False,
+        resume_mode="copy",
+    )
+
+    assert plan.output_mode == ResumeOutputMode.COPY_TO_OUTPUT_JOBS_DIR
+    assert plan.jobs_dir == output_jobs_dir
+    assert plan.mutates_source_trial is False
 
 
 def test_plan_resume_output_infers_in_place_jobs_dir_and_job_name(tmp_path: Path):
@@ -53,6 +84,23 @@ def test_plan_resume_output_infers_in_place_jobs_dir_and_job_name(tmp_path: Path
     )
 
 
+def test_plan_resume_output_explicit_inplace_backup_rejects_legacy_conflict(
+    tmp_path: Path,
+):
+    resume_trial = tmp_path / "jobs" / "demo-job" / "trial-a"
+
+    with pytest.raises(
+        ValueError, match="--resume-mode inplace-backup conflicts with --no-resume-backup"
+    ):
+        plan_resume_output(
+            resolved_resume=resume_trial,
+            jobs_dir=None,
+            output_jobs_dir=None,
+            no_resume_backup=True,
+            resume_mode=ResumeMode.INPLACE_BACKUP,
+        )
+
+
 def test_plan_resume_output_marks_no_backup_in_place_resume(tmp_path: Path):
     jobs_dir = tmp_path / "jobs"
     resume_trial = jobs_dir / "demo-job" / "trial-a"
@@ -73,6 +121,37 @@ def test_plan_resume_output_marks_no_backup_in_place_resume(tmp_path: Path):
     assert plan.uses_backup is False
     with pytest.raises(ValueError, match="does not create a backup"):
         plan.backup_dir("20260519_120000")
+
+
+def test_plan_resume_output_explicit_inplace_no_backup(tmp_path: Path):
+    jobs_dir = tmp_path / "jobs"
+    resume_trial = jobs_dir / "demo-job" / "trial-a"
+
+    plan = plan_resume_output(
+        resolved_resume=resume_trial,
+        jobs_dir=None,
+        output_jobs_dir=None,
+        no_resume_backup=False,
+        resume_mode=ResumeMode.INPLACE_NO_BACKUP,
+    )
+
+    assert plan.output_mode == ResumeOutputMode.IN_PLACE_WITHOUT_BACKUP
+    assert plan.jobs_dir == jobs_dir
+    assert plan.mutates_source_trial is True
+    assert plan.uses_backup is False
+
+
+def test_plan_resume_output_rejects_invalid_resume_mode(tmp_path: Path):
+    resume_trial = tmp_path / "jobs" / "demo-job" / "trial-a"
+
+    with pytest.raises(ValueError, match="--resume-mode must be one of"):
+        plan_resume_output(
+            resolved_resume=resume_trial,
+            jobs_dir=None,
+            output_jobs_dir=None,
+            no_resume_backup=False,
+            resume_mode="unknown",
+        )
 
 
 def test_plan_resume_output_rejects_conflicting_jobs_dir(tmp_path: Path):

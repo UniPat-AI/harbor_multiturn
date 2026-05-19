@@ -60,8 +60,11 @@ Current status:
   directory, backup intent, planned resume source, and config trial name as an
   inspection-only command. It is covered by direct unit tests and the black-box
   parameter validation case.
-- Next: add an explicit resume mode flag only if operators need a clearer
-  spelling than the existing `--output-jobs-dir` / `--no-resume-backup` split.
+- Done: `--resume-mode` provides explicit spellings for `inplace-backup`,
+  `copy`, and `inplace-no-backup` while preserving existing `--output-jobs-dir`
+  and `--no-resume-backup` compatibility.
+- Next: keep any future resume mode changes behind the same planner so CLI
+  compatibility checks remain isolated from trial execution.
 
 ## P2: Fanout Selection and Lineage Observability
 

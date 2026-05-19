@@ -979,6 +979,76 @@ def test_start_rejects_resume_dry_run_without_resume_trial(tmp_path: Path):
         )
 
 
+def test_start_rejects_resume_mode_without_resume_trial(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_task(task_dir)
+
+    with pytest.raises(ValueError, match="--resume-mode requires --resume-trial"):
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_mode="copy",
+        )
+
+
+def test_start_rejects_copy_resume_mode_without_output_jobs_dir(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    resume_trial_dir = tmp_path / "jobs" / "source-job" / "oracle-source"
+    TrialPaths(trial_dir=resume_trial_dir).mkdir()
+    _write_source_trial_config(
+        resume_trial_dir,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_multiround_source_trial_result(
+        resume_trial_dir,
+        completed_round=1,
+        reward=1.0,
+    )
+    _write_round_snapshot_metadata(resume_trial_dir, round_num=1)
+
+    with pytest.raises(
+        ValueError, match="--resume-mode copy requires --output-jobs-dir"
+    ):
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_trial=resume_trial_dir,
+            resume_round=2,
+            resume_mode="copy",
+        )
+
+
+def test_start_rejects_invalid_resume_mode(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    resume_trial_dir = tmp_path / "jobs" / "source-job" / "oracle-source"
+    TrialPaths(trial_dir=resume_trial_dir).mkdir()
+    _write_source_trial_config(
+        resume_trial_dir,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_multiround_source_trial_result(
+        resume_trial_dir,
+        completed_round=1,
+        reward=1.0,
+    )
+    _write_round_snapshot_metadata(resume_trial_dir, round_num=1)
+
+    with pytest.raises(ValueError, match="--resume-mode must be one of"):
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_trial=resume_trial_dir,
+            resume_round=2,
+            resume_mode="unknown",
+        )
+
+
 def test_start_rejects_disable_verification_for_multiround_task(tmp_path: Path):
     task_dir = tmp_path / "task"
     _write_multiround_task(task_dir, num_rounds=3)

@@ -44,6 +44,7 @@ Supported round controls:
 - `--max-round M`
 - `--resume-trial PATH`
 - `--resume-round N`
+- `--resume-mode {inplace-backup,copy,inplace-no-backup}`
 - `--output-jobs-dir DIR`
 - `--no-resume-backup`
 - `--resume-dry-run`
@@ -88,6 +89,8 @@ The CLI rejects combinations that would make the runtime semantics ambiguous:
 - multiturn task with unsupported agent
 - `--disable-verification` on a multiturn task
 - `--resume-trial` without `--resume-round`
+- `--resume-mode` without `--resume-trial`
+- `--resume-mode copy` without `--output-jobs-dir`
 - `--resume-dry-run` without `--resume-trial`
 - `--resume-round < 2`
 - `--resume-trial` with `--start-round`

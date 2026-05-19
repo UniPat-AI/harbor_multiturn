@@ -35,7 +35,11 @@ from harbor.models.trial.config import (
 )
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
-from harbor.multiround.resume_plan import ResumeOutputMode, plan_resume_output
+from harbor.multiround.resume_plan import (
+    ResumeOutputMode,
+    ResumeOutputPlan,
+    plan_resume_output,
+)
 
 jobs_app = Typer(
     no_args_is_help=True,
@@ -976,6 +980,41 @@ def _validate_resume_shape(config: JobConfig) -> None:
         raise ValueError("--resume-trial requires exactly one agent")
 
 
+def _print_multiround_resume_dry_run_report(
+    *,
+    task: Task,
+    resolved_resume: Path,
+    resume_round: int,
+    resume_plan: ResumeOutputPlan,
+    preflight_policy: str,
+) -> None:
+    planned_resume_source = (
+        resume_plan.backup_dir("<timestamp>")
+        if resume_plan.uses_backup
+        else resume_plan.resume_source_dir
+    )
+
+    rows = [
+        ("task", task.name),
+        ("resume_round", str(resume_round)),
+        ("resolved_resume_trial", str(resolved_resume)),
+        ("output_mode", resume_plan.output_mode.value),
+        ("jobs_dir", str(resume_plan.jobs_dir)),
+        ("job_name", resume_plan.job_name or "<auto>"),
+        ("preflight_policy", preflight_policy),
+        ("would_mutate_source_trial", str(resume_plan.mutates_source_trial)),
+        ("would_create_backup", str(resume_plan.uses_backup)),
+        ("planned_resume_source", str(planned_resume_source)),
+        (
+            "config_resume_trial_name",
+            resume_plan.resume_trial_name_for_config or "<none>",
+        ),
+    ]
+    console.print("Multi-round resume dry run")
+    for field, value in rows:
+        console.print(f"{field}: {value}")
+
+
 def _would_enable_roundwise_multiround_attempt_selection(config: JobConfig) -> bool:
     if config.n_attempts <= 1:
         return False
@@ -1831,6 +1870,15 @@ def start(
             show_default=False,
         ),
     ] = None,
+    resume_dry_run: Annotated[
+        bool,
+        Option(
+            "--resume-dry-run",
+            help="Validate and print the multi-round resume plan without mutating trials or starting a job.",
+            rich_help_panel="Multi-round",
+            show_default=False,
+        ),
+    ] = False,
     upload: Annotated[
         bool,
         Option(
@@ -1879,6 +1927,8 @@ def start(
     if (share_org or share_user) and not upload:
         console.print("[red]Error:[/red] --share-org / --share-user requires --upload.")
         raise SystemExit(1)
+    if resume_dry_run and upload:
+        raise ValueError("--resume-dry-run does not support --upload")
 
     if env_file is not None:
         if not env_file.exists():
@@ -2250,6 +2300,8 @@ def start(
 
     if output_jobs_dir is not None and pending_resume is None:
         raise ValueError("--output-jobs-dir requires --resume-trial")
+    if resume_dry_run and pending_resume is None:
+        raise ValueError("--resume-dry-run requires --resume-trial")
 
     if pending_resume is not None:
         resume_trial_path, resolved_resume_round = pending_resume
@@ -2310,6 +2362,16 @@ def start(
             config.job_name = resume_plan.job_name
         resume_source_dir = resume_plan.resume_source_dir
         resume_trial_name_for_config = resume_plan.resume_trial_name_for_config
+
+        if resume_dry_run:
+            _print_multiround_resume_dry_run_report(
+                task=task,
+                resolved_resume=resolved_resume,
+                resume_round=resolved_resume_round,
+                resume_plan=resume_plan,
+                preflight_policy=config.verifier.multiround_resume_preflight_policy,
+            )
+            return
 
         if resume_plan.output_mode != ResumeOutputMode.COPY_TO_OUTPUT_JOBS_DIR:
             if resume_plan.output_mode == ResumeOutputMode.IN_PLACE_WITHOUT_BACKUP:

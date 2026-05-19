@@ -73,6 +73,7 @@ Resume output modes:
 - default in-place resume backs up the source trial under `__resumed_<timestamp>/`, cleans artifacts from the resume point onward, and continues in the original trial directory
 - `--output-jobs-dir` writes a new job from the source trial without mutating the source trial
 - `--no-resume-backup` keeps the in-place write behavior but skips the automatic backup
+- `--resume-dry-run` runs the same resolution and preflight path, prints the planned output mode and resume source, and returns before backup, cleanup, or job creation
 
 ## Roundwise Fanout
 

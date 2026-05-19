@@ -645,6 +645,64 @@ def test_start_no_resume_backup_resumes_from_cleaned_source_trial(tmp_path: Path
     assert multiround_results.read_text() == '{"rounds": []}\n'
 
 
+def test_start_resume_dry_run_reports_plan_without_mutating_source_trial(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    task_dir = tmp_path / "task"
+    _write_multiround_task(task_dir, num_rounds=3)
+
+    job_dir = tmp_path / "2026-04-07__12-00-00"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text('{"old": true}\n')
+    (job_dir / "lock.json").write_text('{"schema_version": 1}\n')
+
+    selected_trial = job_dir / "selected-trial"
+    trial_paths = TrialPaths(trial_dir=selected_trial)
+    trial_paths.mkdir()
+    _write_source_trial_config(
+        selected_trial,
+        source_agent_name="oracle",
+        task_path=task_dir,
+    )
+    _write_multiround_source_trial_result(
+        selected_trial,
+        completed_round=1,
+        reward=1.0,
+    )
+    _write_round_snapshot_metadata(selected_trial, round_num=1)
+    _write_round_snapshot_metadata(selected_trial, round_num=2)
+    stale_round_reward = selected_trial / "verifier" / "round_2_reward.txt"
+    stale_round_reward.write_text("1\n")
+
+    import harbor.job as job_module
+
+    async def fail_create(*args, **kwargs):
+        raise AssertionError("resume dry run must not create or run a job")
+
+    monkeypatch.setattr(job_module.Job, "create", fail_create)
+
+    start(
+        path=task_dir,
+        agent_name="oracle",
+        resume_trial=selected_trial,
+        resume_round=2,
+        resume_dry_run=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "Multi-round resume dry run" in output
+    assert "in_place_with_backup" in output
+    assert "selected-trial" in output
+    assert "selected-trial__resumed_<timestamp>" in output
+    assert not list(job_dir.glob("selected-trial__resumed_*"))
+    assert (job_dir / "result.json").read_text() == '{"old": true}\n'
+    assert (job_dir / "lock.json").exists()
+    assert trial_paths.round_state_snapshot_path(2).exists()
+    assert stale_round_reward.exists()
+
+
 def test_start_accepts_resume_job_dir_and_uses_selected_child_for_claude(
     tmp_path: Path,
 ):
@@ -827,6 +885,18 @@ def test_start_rejects_resume_round_without_resume_trial(tmp_path: Path):
             path=task_dir,
             agent_name="oracle",
             resume_round=3,
+        )
+
+
+def test_start_rejects_resume_dry_run_without_resume_trial(tmp_path: Path):
+    task_dir = tmp_path / "task"
+    _write_task(task_dir)
+
+    with pytest.raises(ValueError, match="--resume-dry-run requires --resume-trial"):
+        start(
+            path=task_dir,
+            agent_name="oracle",
+            resume_dry_run=True,
         )
 
 

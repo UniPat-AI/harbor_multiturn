@@ -46,6 +46,7 @@ Supported round controls:
 - `--resume-round N`
 - `--output-jobs-dir DIR`
 - `--no-resume-backup`
+- `--resume-dry-run`
 - `--multiround-state-cache-policy {off,success,all}`
 - `--multiround-resume-preflight-policy {off,snapshot,strict}`
 - `--multiround-continue-successes-per-round K`
@@ -80,6 +81,7 @@ The CLI rejects combinations that would make the runtime semantics ambiguous:
 - multiturn task with unsupported agent
 - `--disable-verification` on a multiturn task
 - `--resume-trial` without `--resume-round`
+- `--resume-dry-run` without `--resume-trial`
 - `--resume-round < 2`
 - `--resume-trial` with `--start-round`
 - `--output-jobs-dir` without `--resume-trial`

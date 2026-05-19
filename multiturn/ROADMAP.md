@@ -53,6 +53,15 @@ Goal: make resume intent easier to inspect before mutating a source trial.
   `--no-resume-backup` as the expert in-place mode.
 - Extend black-box coverage when a new visible flag is added.
 
+Current status:
+
+- Done: `--resume-dry-run` prints the resolved source, output mode, jobs
+  directory, backup intent, planned resume source, and config trial name without
+  mutating the source trial or starting a job. It is covered by direct unit
+  tests and the black-box parameter validation case.
+- Next: add an explicit resume mode flag only if operators need a clearer
+  spelling than the existing `--output-jobs-dir` / `--no-resume-backup` split.
+
 ## P2: Fanout Selection and Lineage Observability
 
 Goal: make MT@K selection behavior easier to audit without changing default

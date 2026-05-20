@@ -167,6 +167,19 @@ def test_extract_multiround_attempt_idx_handles_root_and_child_names():
     assert Job._extract_multiround_attempt_idx("task__abc1234") is None
 
 
+def test_roundwise_attempt_selection_ignores_package_tasks():
+    package_task = TaskConfig(name="org/demo-task")
+
+    job = object.__new__(Job)
+    job.config = JobConfig(n_attempts=4, tasks=[package_task])
+    job.is_resuming = False
+    job._existing_trial_results = []
+    job._remaining_trial_configs = [TrialConfig(task=package_task)]
+    job._task_configs = [package_task]
+
+    assert job._is_multiround_attempt_selection_enabled() is False
+
+
 @pytest.mark.asyncio
 async def test_roundwise_multiround_child_names_use_parent_attempt_idx(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

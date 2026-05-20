@@ -79,10 +79,10 @@ Resume output modes:
 
 ## Roundwise Multiturn
 
-Eligible local multiturn jobs use roundwise attempt selection, except default
-in-place resume which keeps the original trial writeback contract. `-k 1` is
-the single-branch case; larger `-k` values expand more child attempts per
-selected parent:
+Eligible local path multiturn jobs use roundwise attempt selection, except
+git/package tasks and default in-place resume, which keep the original full
+trial path. `-k 1` is the single-branch case; larger `-k` values expand more
+child attempts per selected parent:
 
 - round 1 creates a frontier of attempts
 - successful parents are selected according to `multiround_continue_successes_per_round`

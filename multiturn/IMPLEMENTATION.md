@@ -68,6 +68,7 @@ Responsibilities:
 - Detect whether the environment implements snapshot capture.
 - Keep compatibility aliases used by local multiturn helpers.
 - Branch `SingleStepTrial._run()` into the multiturn loop when `task.is_multiround`.
+- Keep multiturn verifier execution in shared mode against the live agent workspace; separate verifier mode is rejected during task validation.
 - Archive per-round verifier artifacts and aggregate final results.
 - Defer environment snapshot capture when Job owns roundwise parent selection.
 - Merge same-agent resume trajectory data without deleting valid current-round repeated steps.

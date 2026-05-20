@@ -1,3 +1,5 @@
+import pytest
+
 from harbor.models.task.task import Task
 
 
@@ -70,6 +72,61 @@ change_types = ["extension", "correction"]
     assert task.round_change_type_label(1) == "extension"
     assert task.round_change_types(2) == ["extension", "correction"]
     assert task.round_change_type_label(2) == "extension+correction"
+
+
+def test_task_rejects_separate_verifier_for_multiround(tmp_path):
+    task_dir = _write_task(
+        tmp_path,
+        """
+version = "1.0"
+
+[verifier]
+environment_mode = "separate"
+
+[metadata.multiround]
+num_rounds = 2
+
+[[metadata.multiround.rounds]]
+round = 1
+change_types = ["extension"]
+
+[[metadata.multiround.rounds]]
+round = 2
+change_types = ["correction"]
+""",
+    )
+
+    with pytest.raises(ValueError, match="require shared verifier mode"):
+        Task(task_dir)
+
+    assert Task.is_valid_dir(task_dir) is False
+
+
+def test_task_rejects_implicit_separate_verifier_for_multiround(tmp_path):
+    task_dir = _write_task(
+        tmp_path,
+        """
+version = "1.0"
+
+[verifier.environment]
+
+[metadata.multiround]
+num_rounds = 2
+
+[[metadata.multiround.rounds]]
+round = 1
+change_types = ["extension"]
+
+[[metadata.multiround.rounds]]
+round = 2
+change_types = ["correction"]
+""",
+    )
+
+    with pytest.raises(ValueError, match="verifier.environment"):
+        Task(task_dir)
+
+    assert Task.is_valid_dir(task_dir) is False
 
 
 def test_task_checksum_ignores_terminal_marker_files(tmp_path):

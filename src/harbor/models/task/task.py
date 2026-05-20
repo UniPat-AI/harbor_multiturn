@@ -6,9 +6,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from harbor.models.task.config import TaskConfig
+from harbor.models.task.config import TaskConfig, VerifierEnvironmentMode
 from harbor.models.task.paths import TaskPaths
-from harbor.models.task.verifier_mode import resolve_effective_verifier_env_config
+from harbor.models.task.verifier_mode import (
+    resolve_effective_verifier_env_config,
+    resolve_task_verifier_mode,
+)
 
 # Matches canary lines: HTML comments (<!-- ...canary... -->) or hash comments (# ...canary...)
 _CANARY_LINE_RE = re.compile(r"^(<!--.*canary.*-->|#.*canary.*)$", re.IGNORECASE)
@@ -102,6 +105,7 @@ class Task:
             self.name = self.paths.task_dir.name
 
         self._validate_multiround_shape()
+        self._validate_multiround_verifier_mode()
         self._validate_tests(self.config, self.paths)
         if self.has_steps:
             self.instruction = ""
@@ -144,6 +148,11 @@ class Task:
             Task._validate_tests(config, paths)
         except FileNotFoundError:
             return False
+        if Task._is_multiround_config(config):
+            try:
+                Task._validate_multiround_verifier_mode_config(config)
+            except ValueError:
+                return False
         return True
 
     @staticmethod
@@ -379,6 +388,22 @@ class Task:
                     f"Round {round_num} is missing an OS-compatible test script at "
                     f"{expected}"
                 )
+
+    @staticmethod
+    def _validate_multiround_verifier_mode_config(config: TaskConfig) -> None:
+        if not Task._is_multiround_config(config):
+            return
+
+        if resolve_task_verifier_mode(config) == VerifierEnvironmentMode.SEPARATE:
+            raise ValueError(
+                "Multi-round tasks require shared verifier mode. "
+                "The multi-round loop verifies each round against the live agent "
+                "workspace, so [verifier].environment_mode='separate' and "
+                "[verifier.environment] are not supported for multi-round tasks."
+            )
+
+    def _validate_multiround_verifier_mode(self) -> None:
+        self._validate_multiround_verifier_mode_config(self.config)
 
     def _validate_multiround_shape(self) -> None:
         if not self.is_multiround:

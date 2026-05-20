@@ -21,6 +21,7 @@ Current rules:
 - `change_types` is the preferred field. Legacy `change_type = "extension"` is normalized into `change_types = ["extension"]`.
 - Allowed change types are `extension`, `correction`, and `conflict`.
 - `round_N/tests/` is the complete verifier suite for that round, not a patch over previous tests.
+- Multiturn tasks require Harbor shared verifier mode. `[verifier].environment_mode = "separate"` and `[verifier.environment]` are rejected because round verification targets the live agent workspace.
 
 Top-level `instruction.md` remains required for compatibility with Harbor task discovery. Actual round prompts are read from `round_N/instruction.md`.
 
@@ -116,5 +117,6 @@ The CLI rejects combinations that would make the runtime semantics ambiguous:
 - `--start-round > --max-round`
 - `--resume-trial` on dataset or multi-task jobs
 - roundwise child expansion that requires snapshots while `multiround_state_cache_policy=off`
+- multiturn task with Harbor separate verifier mode
 
 Cross-agent resume is intentionally narrow. Oracle-to-agent handoff is supported for the tested paths; non-Oracle cross-agent handoff must pass the current CLI validation and resume preflight checks.

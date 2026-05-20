@@ -668,7 +668,11 @@ class Job:
             return False
 
         for task_config in self._task_configs:
-            if task_config.is_git_task():
+            if (
+                task_config.is_git_task()
+                or task_config.is_package_task()
+                or task_config.path is None
+            ):
                 return False
             if not Task(task_config.path).is_multiround:
                 return False

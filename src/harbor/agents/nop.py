@@ -24,3 +24,12 @@ class NopAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         pass
+
+    async def run_round(
+        self,
+        instruction: str,
+        round_num: int,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        pass

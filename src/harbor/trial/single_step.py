@@ -1295,6 +1295,7 @@ class SingleStepTrial(Trial):
             "source_trial": self._verifier_config_value("multiround_resume_source"),
             "trial_name": trial_name,
             "round": round_num,
+            "reward": round_reward,
             "status": round_status,
             "created_at": self._now().isoformat(),
         }
@@ -1307,6 +1308,12 @@ class SingleStepTrial(Trial):
         ):
             if key in snapshot_data:
                 snapshot_payload[key] = snapshot_data.get(key)
+        if (
+            snapshot_payload.get("provider") == "daytona"
+            and snapshot_payload.get("provider_state_mode") == "pause_fork"
+            and snapshot_payload.get("archive_path")
+        ):
+            snapshot_payload["provider_fallback_state_mode"] = "archive"
         self.paths.round_state_snapshot_path(round_num).write_text(
             json.dumps(snapshot_payload, indent=2)
         )

@@ -853,6 +853,43 @@ def start(
             show_default=False,
         ),
     ] = None,
+    multi_step_start_step: Annotated[
+        int | None,
+        Option(
+            "--start-step",
+            help=(
+                "For multi-step tasks, run earlier steps with the selected "
+                "--fast-forward-mode and start the configured agent at this "
+                "1-based step."
+            ),
+            rich_help_panel="Multi-step",
+            show_default=False,
+        ),
+    ] = None,
+    multi_step_end_step: Annotated[
+        int | None,
+        Option(
+            "--end-step",
+            help=(
+                "For multi-step tasks, stop after this 1-based step. When "
+                "omitted, runs through the final configured step."
+            ),
+            rich_help_panel="Multi-step",
+            show_default=False,
+        ),
+    ] = None,
+    multi_step_fast_forward_mode: Annotated[
+        str | None,
+        Option(
+            "--fast-forward-mode",
+            help=(
+                "How to prepare steps before --start-step. Currently supports "
+                "'oracle-solution', which runs each prior step's solve script."
+            ),
+            rich_help_panel="Multi-step",
+            show_default=False,
+        ),
+    ] = None,
     task_git_url: Annotated[
         str | None,
         Option(
@@ -1241,6 +1278,12 @@ def start(
         config.artifacts = list(artifact_paths)
     if extra_instruction_paths is not None:
         config.extra_instruction_paths = list(extra_instruction_paths)
+    if multi_step_start_step is not None:
+        config.multi_step_start_step = multi_step_start_step
+    if multi_step_end_step is not None:
+        config.multi_step_end_step = multi_step_end_step
+    if multi_step_fast_forward_mode is not None:
+        config.multi_step_fast_forward_mode = multi_step_fast_forward_mode
 
     task_specified = task_git_url is not None or task_git_commit_id is not None
 

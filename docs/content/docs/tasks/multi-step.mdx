@@ -251,6 +251,41 @@ The trial-level reward is computed from whatever steps did run.
 
 Exceptions during a step (agent crash, setup failure) abort the trial independently of `min_reward`; the threshold check is in addition to, not in place of, the exception path.
 
+## Fast-forwarding to a step
+
+By default, a multi-step trial runs the configured agent on every step from the first step through the last step. For experiments that need to start measuring the agent later in the sequence, Harbor can prepare earlier steps by running their oracle solution scripts and then start the configured agent at a later step:
+
+```bash
+harbor run \
+  --path ./my-multi-step-task \
+  --agent claude-code \
+  --model claude-sonnet-4-5 \
+  --start-step 3 \
+  --fast-forward-mode oracle-solution
+```
+
+With this configuration, Harbor runs `steps/<step-1>/solution/solve.sh` and `steps/<step-2>/solution/solve.sh` in order against the shared environment, skips verification for those fast-forwarded steps, then runs the configured agent and verifier starting at step 3. The trial-level reward is computed from steps that produced verifier results, so fast-forwarded steps are excluded from the default `"mean"` denominator.
+
+You can also stop before the final configured step:
+
+```bash
+harbor run \
+  --path ./my-multi-step-task \
+  --agent claude-code \
+  --model claude-sonnet-4-5 \
+  --start-step 3 \
+  --end-step 4 \
+  --fast-forward-mode oracle-solution
+```
+
+Execution-window options:
+
+- `--start-step N`: 1-based step where the configured agent begins. When `N > 1`, `--fast-forward-mode oracle-solution` is required so earlier steps prepare the shared environment.
+- `--end-step M`: 1-based final step to execute. When omitted, Harbor runs through the final configured step.
+- `--fast-forward-mode oracle-solution`: run each prior step's OS-compatible `steps/<name>/solution/solve.sh` before the agent starts.
+
+This mode is intentionally a single-trial execution window. It does not select parent trajectories across attempts or fork a beam at step boundaries.
+
 ## Trial-level reward: `multi_step_reward_strategy`
 
 After all steps that will run have completed, Harbor derives a single trial-level `verifier_result` from the per-step results. The optional `multi_step_reward_strategy` field at the task root selects how (defaults to `"mean"` when unset):

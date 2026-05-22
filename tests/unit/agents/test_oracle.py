@@ -141,6 +141,41 @@ async def test_oracle_agent_uses_step_specific_solution_dirs(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_oracle_agent_can_select_current_step_after_fast_forward(
+    tmp_path: Path,
+) -> None:
+    task_dir = _make_multi_step_oracle_task(tmp_path)
+    trial_paths = TrialPaths(trial_dir=tmp_path / "trial")
+    trial_paths.mkdir()
+
+    environment = AsyncMock()
+    environment.capabilities.mounted = True
+    environment.os = TaskOS.LINUX
+    environment.exec = AsyncMock(
+        return_value=ExecResult(stdout="", stderr="", return_code=0)
+    )
+    environment.upload_dir = AsyncMock()
+
+    agent = OracleAgent(
+        logs_dir=trial_paths.agent_dir,
+        task_dir=task_dir,
+        trial_paths=trial_paths,
+    )
+
+    agent.set_step_index(1)
+    await agent.run(
+        instruction="step two",
+        environment=environment,
+        context=AgentContext(),
+    )
+
+    environment.upload_dir.assert_awaited_once_with(
+        source_dir=task_dir / "steps" / "step-two" / "solution",
+        target_dir="/solution",
+    )
+
+
+@pytest.mark.asyncio
 async def test_oracle_agent_uses_windows_step_specific_solve_bat(
     tmp_path: Path,
 ) -> None:

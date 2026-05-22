@@ -99,7 +99,7 @@ class MultiStepTrial(Trial):
             self._archive_step_outputs(step)
             return
 
-        await self._run_step_agent(step, step_result)
+        await self._run_step_agent(step, step_result, index=index)
         await self._upload_agent_logs()
 
         artifacts_dir = await self._collect_step_artifacts(step)
@@ -130,8 +130,12 @@ class MultiStepTrial(Trial):
         self,
         step: StepConfig,
         step_result: StepResult,
+        *,
+        index: int,
     ) -> None:
         try:
+            if hasattr(self.agent, "set_step_index"):
+                self.agent.set_step_index(index - 1)
             await self._run_agent_phase(
                 target=step_result,
                 instruction=self.task.step_instruction(step.name),

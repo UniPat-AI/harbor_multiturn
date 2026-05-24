@@ -9,7 +9,7 @@ import shlex
 import tempfile
 from abc import abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar, Union
 from uuid import uuid4
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -67,10 +67,29 @@ if TYPE_CHECKING:
 _SandboxParams = Union[
     "CreateSandboxFromImageParams", "CreateSandboxFromSnapshotParams"
 ]
+_T = TypeVar("_T")
 _DAYTONA_FORK_SOURCE_PREFIX = "daytona-fork-source:"
 _DAYTONA_SNAPSHOT_PREFIX = "daytona-snapshot:"
 _DAYTONA_ARCHIVE_PREFIX = "daytona-archive:"
 _DAYTONA_STATE_MODES = {"auto", "pause_fork", "snapshot", "archive"}
+_DAYTONA_RESOURCE_RETRY_STATUS_CODES = {429, 503, 507}
+_DAYTONA_RESOURCE_RETRY_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"insufficient.*(?:resource|capacity|quota|cpu|memory|disk|storage)",
+        r"(?:resource|capacity|quota|cpu|memory|disk|storage).*"
+        r"(?:insufficient|exhausted|unavailable|exceeded|limit|out of|not enough|no available)",
+        r"no available (?:resource|capacity|runner|worker|sandbox|slot)",
+        r"out of (?:resource|capacity|quota|cpu|memory|disk|storage)",
+        r"(?:cannot|can't|unable to) allocate",
+        r"allocation failed",
+        r"scheduling failed",
+        r"resource exhausted",
+        r"quota exceeded",
+        r"capacity (?:unavailable|exceeded|exhausted)",
+        r"limit exceeded",
+    ]
+]
 
 
 def _coerce_int(value: object, default: int) -> int:
@@ -78,6 +97,15 @@ def _coerce_int(value: object, default: int) -> int:
         return default
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: object, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -123,6 +151,55 @@ def _is_daytona_fork_unavailable(exc: Exception) -> bool:
     return "Cannot POST" in message and (
         "/fork" in message or "/snapshot" in message
     )
+
+
+def _exception_messages(exc: BaseException) -> list[str]:
+    messages: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current))
+        for attr in ("message", "body", "response_text", "text", "detail"):
+            value = getattr(current, attr, None)
+            if value:
+                messages.append(str(value))
+        current = current.__cause__ or current.__context__
+    return messages
+
+
+def _exception_status_codes(exc: BaseException) -> set[int]:
+    status_codes: set[int] = set()
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for attr in ("status", "status_code", "code"):
+            value = getattr(current, attr, None)
+            try:
+                if value is not None:
+                    status_codes.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        response = getattr(current, "response", None)
+        if response is not None:
+            for attr in ("status", "status_code"):
+                value = getattr(response, attr, None)
+                try:
+                    if value is not None:
+                        status_codes.add(int(value))
+                except (TypeError, ValueError):
+                    pass
+        current = current.__cause__ or current.__context__
+    return status_codes
+
+
+def _is_daytona_resource_pressure_error(exc: Exception) -> bool:
+    """Best-effort classifier for Daytona capacity/quota allocation failures."""
+    if _exception_status_codes(exc) & _DAYTONA_RESOURCE_RETRY_STATUS_CODES:
+        return True
+    text = "\n".join(_exception_messages(exc))
+    return any(pattern.search(text) for pattern in _DAYTONA_RESOURCE_RETRY_PATTERNS)
 
 
 class DaytonaClientManager:
@@ -435,7 +512,10 @@ class _DaytonaDirect(_DaytonaStrategy):
             parent = await daytona.get(source)
             parent_state = str(getattr(parent, "state", "")).lower()
             if "started" not in parent_state:
-                await parent.start(timeout=env._daytona_fork_timeout_sec)
+                await env._run_daytona_resource_retry(
+                    "start fork source sandbox",
+                    lambda: parent.start(timeout=env._daytona_fork_timeout_sec),
+                )
 
             fork_name = env._daytona_state_name("hbfork", env.session_id)
             env.logger.debug(
@@ -444,9 +524,12 @@ class _DaytonaDirect(_DaytonaStrategy):
                 fork_name,
             )
             try:
-                env._sandbox = await parent._experimental_fork(
-                    name=fork_name,
-                    timeout=env._daytona_fork_timeout_sec,
+                env._sandbox = await env._run_daytona_resource_retry(
+                    "fork sandbox",
+                    lambda: parent._experimental_fork(
+                        name=fork_name,
+                        timeout=env._daytona_fork_timeout_sec,
+                    ),
                 )
             except Exception as exc:
                 if not _is_daytona_fork_unavailable(exc):
@@ -462,9 +545,12 @@ class _DaytonaDirect(_DaytonaStrategy):
                     f"{env.session_id}-{source}",
                 )
                 try:
-                    await parent._experimental_create_snapshot(
-                        snapshot_name,
-                        timeout=env._daytona_snapshot_timeout_sec,
+                    await env._run_daytona_resource_retry(
+                        "create fallback snapshot",
+                        lambda: parent._experimental_create_snapshot(
+                            snapshot_name,
+                            timeout=env._daytona_snapshot_timeout_sec,
+                        ),
                     )
                     env._transient_resume_snapshot_names.append(snapshot_name)
                     params = CreateSandboxFromSnapshotParams(
@@ -1255,6 +1341,12 @@ class DaytonaEnvironment(BaseEnvironment):
                 process-wide client, so the first trial to initialize wins;
                 pass the same value on every trial in a job. Pass ``null`` to
                 disable the pool size limit (unlimited concurrent connections).
+            daytona_resource_retry_max: Maximum attempts for Daytona resource
+                pressure errors during sandbox allocation/start/fork/snapshot.
+            daytona_resource_retry_initial_delay_sec: Initial exponential
+                backoff delay for resource pressure retries.
+            daytona_resource_retry_max_delay_sec: Maximum exponential backoff
+                delay for resource pressure retries.
 
         Raises:
             FileNotFoundError: If neither Dockerfile nor docker-compose.yaml is found.
@@ -1310,6 +1402,36 @@ class DaytonaEnvironment(BaseEnvironment):
         self._daytona_archive_timeout_sec = _coerce_int(
             self._kwargs.get("daytona_archive_timeout_sec"),
             900,
+        )
+        self._daytona_resource_retry_max = max(
+            1,
+            _coerce_int(
+                self._kwargs.get(
+                    "daytona_resource_retry_max",
+                    os.environ.get("DAYTONA_RESOURCE_RETRY_MAX"),
+                ),
+                4,
+            ),
+        )
+        self._daytona_resource_retry_initial_delay_sec = max(
+            0.0,
+            _coerce_float(
+                self._kwargs.get(
+                    "daytona_resource_retry_initial_delay_sec",
+                    os.environ.get("DAYTONA_RESOURCE_RETRY_INITIAL_DELAY"),
+                ),
+                15.0,
+            ),
+        )
+        self._daytona_resource_retry_max_delay_sec = max(
+            self._daytona_resource_retry_initial_delay_sec,
+            _coerce_float(
+                self._kwargs.get(
+                    "daytona_resource_retry_max_delay_sec",
+                    os.environ.get("DAYTONA_RESOURCE_RETRY_MAX_DELAY"),
+                ),
+                120.0,
+            ),
         )
         if network_block_all is not None:
             self._network_block_all = network_block_all
@@ -1464,9 +1586,12 @@ class DaytonaEnvironment(BaseEnvironment):
         if mode == "snapshot":
             snapshot_name = self._daytona_state_name("hbsnap", snapshot_id)
             try:
-                await self._sandbox._experimental_create_snapshot(
-                    snapshot_name,
-                    timeout=self._daytona_snapshot_timeout_sec,
+                await self._run_daytona_resource_retry(
+                    "create state snapshot",
+                    lambda: self._sandbox._experimental_create_snapshot(
+                        snapshot_name,
+                        timeout=self._daytona_snapshot_timeout_sec,
+                    ),
                 )
             except Exception as exc:
                 if not _is_daytona_fork_unavailable(exc):
@@ -1531,11 +1656,39 @@ class DaytonaEnvironment(BaseEnvironment):
                 connection_pool_maxsize=self._kwargs["connection_pool_maxsize"],
             )
 
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    async def _run_daytona_resource_retry(
+        self,
+        operation_name: str,
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        attempts = self._daytona_resource_retry_max
+        delay = self._daytona_resource_retry_initial_delay_sec
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except Exception as exc:
+                if (
+                    attempt >= attempts
+                    or not _is_daytona_resource_pressure_error(exc)
+                ):
+                    raise
+                self.logger.warning(
+                    "Daytona %s failed with likely resource pressure; retrying "
+                    "in %.1fs (%d/%d): %s",
+                    operation_name,
+                    delay,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                delay = min(
+                    self._daytona_resource_retry_max_delay_sec,
+                    max(delay * 2, 1.0),
+                )
+        raise RuntimeError(f"Daytona {operation_name} did not run")
+
     async def _create_sandbox(
         self,
         params: _SandboxParams,
@@ -1547,28 +1700,34 @@ class DaytonaEnvironment(BaseEnvironment):
 
         daytona = await self._client_manager.get_client()
 
-        # Shield the creation call from cancellation. If the caller is
-        # cancelled mid-HTTP-request, CancelledError can interrupt
-        # `daytona.create()` after the server has created the sandbox but
-        # before we store the reference in `self._sandbox`, causing
-        # `_stop_sandbox()` to skip deletion and leak the sandbox.
-        create_task = asyncio.ensure_future(
-            daytona.create(
-                params=params,
-                timeout=round(self.task_env_config.build_timeout_sec),
+        async def create_once():
+            # Shield the creation call from cancellation. If the caller is
+            # cancelled mid-HTTP-request, CancelledError can interrupt
+            # `daytona.create()` after the server has created the sandbox but
+            # before we store the reference in `self._sandbox`, causing
+            # `_stop_sandbox()` to skip deletion and leak the sandbox.
+            create_task = asyncio.ensure_future(
+                daytona.create(
+                    params=params,
+                    timeout=round(self.task_env_config.build_timeout_sec),
+                )
             )
-        )
-        try:
-            self._sandbox = await asyncio.shield(create_task)
-        except asyncio.CancelledError:
-            # The outer scope was cancelled. Wait briefly for the in-flight
-            # creation to finish so we can capture the sandbox reference for
-            # proper cleanup.
             try:
-                self._sandbox = await asyncio.wait_for(create_task, timeout=30)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                create_task.cancel()
-            raise
+                return await asyncio.shield(create_task)
+            except asyncio.CancelledError:
+                # The outer scope was cancelled. Wait briefly for the in-flight
+                # creation to finish so we can capture the sandbox reference for
+                # proper cleanup.
+                try:
+                    self._sandbox = await asyncio.wait_for(create_task, timeout=30)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    create_task.cancel()
+                raise
+
+        self._sandbox = await self._run_daytona_resource_retry(
+            "create sandbox",
+            create_once,
+        )
 
     @retry(
         stop=stop_after_attempt(2),

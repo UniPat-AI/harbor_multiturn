@@ -1,5 +1,6 @@
 """Unit tests for DaytonaEnvironment strategy selection and DinD compose logic."""
 
+import asyncio
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from harbor.environments.daytona import (
     _DAYTONA_FORK_SOURCE_PREFIX,
     _DAYTONA_SNAPSHOT_PREFIX,
     _ensure_daytona_ssl_cert_file,
+    _is_daytona_resource_pressure_error,
 )
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.config import ServiceVolumeConfig
@@ -127,15 +129,23 @@ class _FakeSandbox:
 
 
 class _FakeDaytonaClient:
-    def __init__(self, parent: _FakeSandbox):
+    def __init__(
+        self,
+        parent: _FakeSandbox,
+        *,
+        create_errors: list[Exception] | None = None,
+    ):
         self.parent = parent
         self.created_params: list[object] = []
+        self.create_errors = list(create_errors or [])
 
     async def get(self, sandbox_id_or_name: str):
         assert sandbox_id_or_name == self.parent.id
         return self.parent
 
     async def create(self, params, timeout=None):
+        if self.create_errors:
+            raise self.create_errors.pop(0)
         self.created_params.append(params)
         return _FakeSandbox("snapshot-child", state="started")
 
@@ -170,6 +180,38 @@ def test_ensure_daytona_ssl_cert_file_preserves_user_value(
     _ensure_daytona_ssl_cert_file()
 
     assert os.environ["SSL_CERT_FILE"] == "/custom/ca.pem"
+
+
+class _ExceptionWithStatus(Exception):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_daytona_resource_pressure_classifier_matches_common_capacity_errors():
+    messages = [
+        "insufficient resources to schedule sandbox",
+        "no available worker capacity in target",
+        "resource exhausted: quota exceeded",
+        "unable to allocate requested memory",
+    ]
+
+    assert all(
+        _is_daytona_resource_pressure_error(RuntimeError(message))
+        for message in messages
+    )
+    assert _is_daytona_resource_pressure_error(
+        _ExceptionWithStatus("service unavailable", 503)
+    )
+
+
+def test_daytona_resource_pressure_classifier_ignores_non_resource_errors():
+    assert not _is_daytona_resource_pressure_error(
+        RuntimeError("Cannot POST /api/sandbox/parent-1/fork")
+    )
+    assert not _is_daytona_resource_pressure_error(
+        RuntimeError("sandbox not found")
+    )
 
 
 # ── Strategy selection ────────────────────────────────────────────────
@@ -212,6 +254,39 @@ class TestStrategySelection:
 
 
 class TestDirectMultiroundState:
+    async def test_create_sandbox_retries_daytona_resource_pressure(
+        self, monkeypatch: pytest.MonkeyPatch, temp_dir
+    ):
+        parent = _FakeSandbox("parent-1", state="started")
+        client = _FakeDaytonaClient(
+            parent,
+            create_errors=[
+                RuntimeError("insufficient resources to schedule sandbox"),
+                RuntimeError("no available worker capacity in target"),
+            ],
+        )
+        manager = _FakeClientManager(client)
+
+        env = _make_env(temp_dir, compose=False)
+        env._client_manager = manager
+        env._daytona_resource_retry_max = 3
+        env._daytona_resource_retry_initial_delay_sec = 0.5
+        env._daytona_resource_retry_max_delay_sec = 2.0
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay: float):
+            sleeps.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        params = object()
+        await env._create_sandbox(params=params)  # type: ignore[arg-type]
+
+        assert sleeps == [0.5, 1.0]
+        assert client.created_params == [params]
+        assert env._sandbox is not None
+        assert env._sandbox.id == "snapshot-child"
+
     async def test_pause_fork_capture_stops_and_retains_sandbox(
         self, monkeypatch: pytest.MonkeyPatch, temp_dir
     ):

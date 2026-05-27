@@ -12,6 +12,8 @@ Harbor is a framework from the creators of [Terminal-Bench](https://www.tbench.a
 - Conduct experiments in thousands of environments in parallel through providers like Daytona and Modal. 
 - Generate rollouts for RL optimization.
 
+This fork also supports the multi-turn evaluation workflow used by [EvoCode-Bench](https://arxiv.org/abs/2605.24110). The released benchmark data is available on [Hugging Face](https://huggingface.co/datasets/UnipatAI/EvoCodeBench), and the project homepage is maintained in [UniPat_Homepage](https://github.com/UniPat-AI/UniPat_Homepage).
+
 
 ## Installation
 
@@ -79,7 +81,17 @@ url = {https://github.com/laude-institute/harbor},
 year = {2026}
 }
 ```
+For the multi-turn benchmark, please also cite:
 
-
-
+```bibtex
+@misc{shen2026evocodebench,
+  title = {EvoCode-Bench: Evaluating Coding Agents in Multi-Turn Iterative Interactions},
+  author = {Haiyang Shen and Xuanzhong Chen and Wendong Xu and Yun Ma and Liang Chen and Kuan Li},
+  year = {2026},
+  eprint = {2605.24110},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.SE},
+  url = {https://arxiv.org/abs/2605.24110}
+}
+```
 
